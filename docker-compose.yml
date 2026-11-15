@@ -1,0 +1,114 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: bot_talker_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bot_talker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bot_talker_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-bot_talker}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot_talker} -d ${POSTGRES_DB:-bot_talker}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: bot_talker_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: bot_talker_backend:latest
+    container_name: bot_talker_api
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bot_talker}:${POSTGRES_PASSWORD:-bot_talker_secret}@postgres:5432/${POSTGRES_DB:-bot_talker}
+      REDIS_URL: redis://redis:6379/0
+    command: ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot-gateway:
+    image: bot_talker_backend:latest
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bot_talker_bot
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bot_talker}:${POSTGRES_PASSWORD:-bot_talker_secret}@postgres:5432/${POSTGRES_DB:-bot_talker}
+      REDIS_URL: redis://redis:6379/0
+    command: ["python", "-m", "app.bot.main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend-api:
+        condition: service_healthy
+
+  memory-worker:
+    image: bot_talker_backend:latest
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bot_talker_worker
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bot_talker}:${POSTGRES_PASSWORD:-bot_talker_secret}@postgres:5432/${POSTGRES_DB:-bot_talker}
+      REDIS_URL: redis://redis:6379/0
+    command: ["arq", "app.worker.main.WorkerSettings"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend-api:
+        condition: service_healthy
+
+  admin-ui:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: bot_talker_ui
+    restart: unless-stopped
+    ports:
+      - "${ADMIN_PORT:-8080}:80"
+    depends_on:
+      backend-api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
