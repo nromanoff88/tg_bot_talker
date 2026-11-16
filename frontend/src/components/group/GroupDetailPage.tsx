@@ -67,7 +67,7 @@ export function GroupDetailPage({ groupId, onBack }: Props) {
     { key: 'members', label: 'Участники (Досье)', icon: <Users className="w-4 h-4" /> },
     { key: 'context', label: 'Контекст и Векторная память', icon: <Brain className="w-4 h-4" /> },
     { key: 'behavior', label: 'Персона и Поведение', icon: <Sliders className="w-4 h-4" /> },
-    { key: 'import', label: 'Импорт Telegram JSON', icon: <FileUp className="w-4 h-4" /> },
+    { key: 'import', label: 'Импорт истории (HTML / JSON)', icon: <FileUp className="w-4 h-4" /> },
   ];
 
   return (

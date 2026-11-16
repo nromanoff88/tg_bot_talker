@@ -3,12 +3,13 @@ from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.types import ChatMemberUpdated, Message as TgMessage, MessageReactionUpdated, ReactionTypeEmoji
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.bot.debouncer import schedule_group_debounce
 from app.database import AsyncSessionLocal
 from app.models import GroupMember, Message, SystemConfig
 from app.redis_client import get_arq_pool, publish_group_event
+from app.services.import_service import SYNTHETIC_TG_ID_BASE
 from app.services.memory_service import ensure_group_initialized
 
 logger = logging.getLogger(__name__)
@@ -78,16 +79,29 @@ async def handle_group_message(message: TgMessage) -> None:
         )
         member = (await session.execute(mem_stmt)).scalars().first()
         if not member:
-            member = GroupMember(
-                group_id=group_id,
-                telegram_user_id=from_user.id,
-                username=from_user.username,
-                display_name=full_name[:255],
-                message_count=1,
-                last_seen_at=msg_dt,
+            # Проверяем, нет ли карточки этого участника, созданной при импорте HTML-истории (по имени)
+            synth_stmt = select(GroupMember).where(
+                GroupMember.group_id == group_id,
+                GroupMember.telegram_user_id >= SYNTHETIC_TG_ID_BASE,
+                func.lower(GroupMember.display_name) == full_name[:255].lower(),
             )
-            session.add(member)
-            await session.flush()
+            member = (await session.execute(synth_stmt)).scalars().first()
+            if member:
+                member.telegram_user_id = from_user.id
+                member.username = from_user.username
+                member.message_count = (member.message_count or 0) + 1
+                member.last_seen_at = msg_dt
+            else:
+                member = GroupMember(
+                    group_id=group_id,
+                    telegram_user_id=from_user.id,
+                    username=from_user.username,
+                    display_name=full_name[:255],
+                    message_count=1,
+                    last_seen_at=msg_dt,
+                )
+                session.add(member)
+                await session.flush()
         else:
             member.username = from_user.username
             member.display_name = full_name[:255]

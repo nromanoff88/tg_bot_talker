@@ -23,7 +23,7 @@ from app.schemas import (
     MemoryEpisodeOut,
     MemoryEpisodeUpdate,
 )
-from app.services.import_service import import_telegram_desktop_json
+from app.services.import_service import import_telegram_desktop_files
 from app.services.llm_service import create_embedding
 from app.services.memory_service import (
     ensure_group_initialized,
@@ -367,22 +367,31 @@ async def force_trigger_proactive(
 @router.post("/{group_id}/import", response_model=ImportHistoryResponse)
 async def import_group_history(
     group_id: int,
-    file: UploadFile = File(...),
+    files: Optional[list[UploadFile]] = File(default=None),
+    file: Optional[UploadFile] = File(default=None),
     trigger_analysis: bool = Query(default=True),
     session: AsyncSession = Depends(get_db),
 ) -> ImportHistoryResponse:
-    raw_bytes = await file.read()
+    upload_list: list[UploadFile] = []
+    if files:
+        upload_list.extend(files)
+    if file:
+        upload_list.append(file)
+    if not upload_list:
+        raise HTTPException(status_code=400, detail="Не выбран ни один файл для импорта.")
+
+    files_bytes = [await f.read() for f in upload_list]
     try:
-        stats = await import_telegram_desktop_json(
+        stats = await import_telegram_desktop_files(
             session=session,
             group_id=group_id,
-            raw_bytes=raw_bytes,
+            files_bytes=files_bytes,
             trigger_analysis=trigger_analysis,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Ошибка чтения JSON экспорта: {exc}")
+        raise HTTPException(status_code=400, detail=f"Ошибка чтения файла экспорта: {exc}")
 
     return ImportHistoryResponse(**stats)
 

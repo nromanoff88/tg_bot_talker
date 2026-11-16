@@ -9,7 +9,7 @@ interface Props {
 }
 
 export function ImportHistoryTab({ groupId, onImported }: Props) {
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [triggerAnalysis, setTriggerAnalysis] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [result, setResult] = useState<ImportHistoryResult | null>(null);
@@ -17,12 +17,12 @@ export function ImportHistoryTab({ groupId, onImported }: Props) {
 
   const handleImport = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!file) return;
+    if (files.length === 0) return;
     setUploading(true);
     setError('');
     setResult(null);
     try {
-      const res = await api.importTelegramJson(groupId, file, triggerAnalysis);
+      const res = await api.importTelegramHistory(groupId, files, triggerAnalysis);
       setResult(res);
       onImported();
     } catch (err: any) {
@@ -32,11 +32,13 @@ export function ImportHistoryTab({ groupId, onImported }: Props) {
     }
   };
 
+  const totalSizeMb = files.reduce((acc, f) => acc + f.size, 0) / 1024 / 1024;
+
   return (
     <div className="max-w-3xl space-y-6">
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
         <h3 className="text-base font-semibold text-white">
-          Импорт старой истории группы из Telegram Desktop (`result.json`)
+          Импорт старой истории группы из Telegram Desktop (`messages.html` / `result.json`)
         </h3>
 
         <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-300 space-y-1.5">
@@ -45,23 +47,33 @@ export function ImportHistoryTab({ groupId, onImported }: Props) {
           </div>
           <div>1. Открой нужную группу в приложении Telegram Desktop на компьютере.</div>
           <div>2. Нажми «⋮» в правом верхнем углу → «Экспорт истории чата».</div>
-          <div>3. Сними все галочки с фото/видео/файлов и выбери формат «Машиночитаемый JSON».</div>
-          <div>4. Загрузи полученный файл `result.json` ниже — дубликаты сообщений пропускаются автоматически.</div>
+          <div>3. Сними галочки с фото/видео/файлов и нажми «Экспортировать» (поддерживается стандартный HTML и JSON).</div>
+          <div>
+            4. Выбери файл `messages.html` (или сразу все `messages.html`, `messages2.html`, `messages3.html`...) —
+            дубликаты сообщений пропускаются автоматически.
+          </div>
         </div>
 
         <form onSubmit={handleImport} className="space-y-4">
           <label className="block border-2 border-dashed border-slate-700 hover:border-indigo-500/60 rounded-2xl p-8 text-center cursor-pointer transition bg-slate-950/60">
             <FileUp className="w-8 h-8 text-indigo-400 mx-auto mb-2" />
             <div className="text-sm font-medium text-white">
-              {file ? file.name : 'Выбери файл result.json с компьютера'}
+              {files.length > 0
+                ? files.length === 1
+                  ? files[0].name
+                  : `Выбрано файлов: ${files.length} (${files.map((f) => f.name).join(', ')})`
+                : 'Выбери messages.html (можно сразу несколько) или result.json'}
             </div>
             <div className="text-xs text-slate-500 mt-1">
-              {file ? `${(file.size / 1024 / 1024).toFixed(2)} МБ` : 'Поддерживаются файлы экспорта до 150 МБ'}
+              {files.length > 0
+                ? `Общий размер: ${totalSizeMb.toFixed(2)} МБ`
+                : 'Поддерживаются HTML и JSON файлы экспорта Telegram Desktop до 150 МБ'}
             </div>
             <input
               type="file"
-              accept=".json,application/json"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
+              multiple
+              accept=".html,.htm,.json,text/html,application/json"
+              onChange={(e) => setFiles(e.target.files ? Array.from(e.target.files) : [])}
               className="hidden"
             />
           </label>
@@ -83,7 +95,7 @@ export function ImportHistoryTab({ groupId, onImported }: Props) {
 
           <button
             type="submit"
-            disabled={!file || uploading}
+            disabled={files.length === 0 || uploading}
             className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-xs font-medium text-white cursor-pointer"
           >
             {uploading ? 'Импортируем историю...' : 'Загрузить историю в память группы'}
@@ -105,4 +117,3 @@ export function ImportHistoryTab({ groupId, onImported }: Props) {
     </div>
   );
 }
-

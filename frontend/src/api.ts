@@ -214,9 +214,11 @@ export const api = {
     request<{ status: string; text?: string }>(`/api/groups/${groupId}/actions/trigger-proactive`, {
       method: 'POST',
     }),
-  importTelegramJson: (groupId: number, file: File, triggerAnalysis: boolean) => {
+  importTelegramHistory: (groupId: number, files: File[], triggerAnalysis: boolean) => {
     const fd = new FormData();
-    fd.append('file', file);
+    for (const f of files) {
+      fd.append('files', f);
+    }
     return request<ImportHistoryResult>(
       `/api/groups/${groupId}/import?trigger_analysis=${triggerAnalysis}`,
       {
