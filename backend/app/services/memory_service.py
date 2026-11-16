@@ -414,7 +414,7 @@ async def analyze_group_memory_batch(
             system_prompt=MEMORY_EXTRACTION_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             temperature=0.2,
-            max_tokens=3000,
+            max_tokens=4500,
         )
 
         facts_added = 0

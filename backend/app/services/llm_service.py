@@ -247,20 +247,124 @@ def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int, r
     return round((prompt_tokens * in_rate + completion_tokens * out_rate) / 1_000_000, 6)
 
 
+def _strip_thinking_tags(raw_text: str) -> str:
+    """Удаляет блоки рассуждений <think>...</think>, которые возвращают reasoning-модели (DeepSeek, Qwen и др.)."""
+    text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    # Если блок <think> остался незакрытым из-за лимита токенов — обрезаем его
+    if "<think>" in text.lower():
+        idx = text.lower().find("<think>")
+        after = text[idx + 7 :]
+        brace_idx = after.find("{")
+        text = (text[:idx] + (after[brace_idx:] if brace_idx != -1 else "")).strip()
+    return text.strip()
+
+
+def _repair_truncated_json(raw_json: str) -> str:
+    """Восстанавливает обрезанный на полуслове JSON (закрывает незакрытую строку и открытые скобки)."""
+    s = raw_json.strip()
+    if not s.startswith("{"):
+        start = s.find("{")
+        if start != -1:
+            s = s[start:]
+        else:
+            return "{}"
+
+    in_str = False
+    escape = False
+    stack: list[str] = []
+    out_chars: list[str] = []
+
+    for ch in s:
+        if escape:
+            out_chars.append(ch)
+            escape = False
+            continue
+        if ch == "\\":
+            out_chars.append(ch)
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            out_chars.append(ch)
+            continue
+        if in_str:
+            if ch == "\n":
+                out_chars.append("\\n")
+            elif ch == "\r":
+                continue
+            elif ch == "\t":
+                out_chars.append("\\t")
+            else:
+                out_chars.append(ch)
+            continue
+
+        out_chars.append(ch)
+        if ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in ("}", "]") and stack and stack[-1] == ch:
+            stack.pop()
+
+    repaired = "".join(out_chars).rstrip()
+    if escape and repaired.endswith("\\"):
+        repaired = repaired[:-1]
+    if in_str:
+        repaired += '"'
+
+    # Убираем висящие запятые или незаконченные ключи перед закрытием скобок
+    repaired = re.sub(r",\s*$", "", repaired)
+    repaired = re.sub(r',\s*"[^"]*"\s*:\s*$', "", repaired)
+    repaired = re.sub(r'\{\s*"[^"]*"\s*:\s*$', "{", repaired)
+    repaired = re.sub(r',\s*"[^"]*"\s*$', "", repaired)
+
+    while stack:
+        repaired = re.sub(r",\s*$", "", repaired)
+        repaired += stack.pop()
+
+    return repaired
+
+
 def _extract_json_dict(raw_text: str) -> dict[str, Any]:
-    text = raw_text.strip()
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-    if fence_match:
-        text = fence_match.group(1)
-    else:
-        start = text.find("{")
+    text = _strip_thinking_tags(raw_text)
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE).strip()
+
+    start = text.find("{")
+    if start != -1:
         end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            text = text[start : end + 1]
-    parsed = json.loads(text)
-    if not isinstance(parsed, dict):
-        raise ValueError("Expected JSON object from LLM")
-    return parsed
+        if end != -1 and end > start:
+            candidate = text[start : end + 1]
+        else:
+            candidate = text[start:]
+    else:
+        candidate = text
+
+    for attempt_str in (candidate, _repair_truncated_json(candidate)):
+        try:
+            parsed = json.loads(attempt_str, strict=False)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+
+    # Regex fallback для классификатора решений, если модель выдала совсем нестандартно экранированный JSON
+    fallback: dict[str, Any] = {}
+    m_act = re.search(r'"action"\s*:\s*"(ignore|react|reply|message)"', text, flags=re.IGNORECASE)
+    if m_act:
+        fallback["action"] = m_act.group(1).lower()
+    m_tid = re.search(r'"target_tg_msg_id"\s*:\s*(\d+)', text)
+    if m_tid:
+        fallback["target_tg_msg_id"] = int(m_tid.group(1))
+    m_emj = re.search(r'"emoji"\s*:\s*"([^"]+)"', text)
+    if m_emj:
+        fallback["emoji"] = m_emj.group(1)
+    m_rsn = re.search(r'"reasoning"\s*:\s*"([^"\n]*)', text)
+    if m_rsn:
+        fallback["reasoning"] = m_rsn.group(1).strip()
+    if fallback:
+        return fallback
+
+    raise ValueError(f"Expected JSON object from LLM, got: {text[:180]}")
 
 
 def _normalize_vector_dim(vec: list[float], target_dim: int = 1536) -> list[float]:
@@ -358,6 +462,8 @@ async def complete_json(
     if not cfg.llm_api_key:
         raise RuntimeError("LLM API ключ не настроен. Укажите его в Настройках админки или в .env.")
 
+    # Reasoning-модели (DeepSeek, Qwen3, Gemini Thinking) расходуют max_tokens на внутренние рассуждения
+    effective_max_tokens = max(max_tokens, 2500)
     raw_model = cfg.llm_fast_model if tier == "fast" else cfg.llm_smart_model
     is_google, is_vertex = _detect_google_mode(cfg.llm_base_url, cfg.llm_api_key)
 
@@ -369,7 +475,7 @@ async def complete_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             json_mode=True,
         )
         parsed = _extract_json_dict(content or "{}")
@@ -388,7 +494,7 @@ async def complete_json(
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             response_format={"type": "json_object"},
         )
     except Exception:
@@ -396,7 +502,7 @@ async def complete_json(
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
         )
 
     content = (resp.choices[0].message.content or "{}") if resp.choices else "{}"
@@ -426,20 +532,22 @@ async def complete_text(
     if not cfg.llm_api_key:
         raise RuntimeError("LLM API ключ не настроен. Укажите его в Настройках админки или в .env.")
 
+    effective_max_tokens = max(max_tokens, 1600)
     raw_model = cfg.llm_fast_model if tier == "fast" else cfg.llm_smart_model
     is_google, is_vertex = _detect_google_mode(cfg.llm_base_url, cfg.llm_api_key)
 
     if is_google:
-        return await _google_generate(
+        txt, usage = await _google_generate(
             api_key=cfg.llm_api_key,
             use_vertex=is_vertex,
             model=raw_model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             json_mode=False,
         )
+        return _strip_thinking_tags(txt), usage
 
     client, model = await _build_openai_client_and_model(
         cfg.llm_base_url, cfg.llm_api_key, raw_model, kind="gpt", timeout=60.0
@@ -451,10 +559,10 @@ async def complete_text(
             {"role": "user", "content": user_prompt},
         ],
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_tokens=effective_max_tokens,
     )
 
-    content = (resp.choices[0].message.content or "").strip() if resp.choices else ""
+    content = _strip_thinking_tags((resp.choices[0].message.content or "").strip()) if resp.choices else ""
     usage_obj = resp.usage
     p_tok = getattr(usage_obj, "prompt_tokens", 0) or 0
     c_tok = getattr(usage_obj, "completion_tokens", 0) or 0
