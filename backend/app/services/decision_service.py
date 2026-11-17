@@ -1,4 +1,5 @@
 import logging
+import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -181,6 +182,42 @@ async def evaluate_group_batch_and_decide(
             )
             return BotDecisionResult(action="ignore", reasoning=reason)
 
+    effective_chattiness = g_settings.chattiness_level
+    if (
+        not is_direct_ping
+        and g_settings.quiet_hours_enabled
+        and is_within_quiet_hours(g_settings.timezone, g_settings.quiet_hours_start, g_settings.quiet_hours_end, now_utc)
+    ):
+        # В тихие часы не встреваем сами без веского повода
+        effective_chattiness = round(effective_chattiness * 0.35, 2)
+
+    # Hard Gate 3: математический вероятностный фильтр для сообщений без прямого обращения к боту
+    if not is_direct_ping and effective_chattiness < 1.0:
+        if effective_chattiness <= 0.0:
+            reason = "Общительность группы 0% — без прямого тега или реплая бот молчит."
+            await _save_decision_log(
+                session, group_id, trigger_tg_msg_ids, "ignore", reason, {}, {"gate": "chattiness_zero"}, LLMUsage()
+            )
+            return BotDecisionResult(action="ignore", reasoning=reason)
+
+        roll = random.random()
+        if roll > effective_chattiness:
+            reason = (
+                f"Вероятностный фильтр (общительность {int(effective_chattiness * 100)}%, "
+                f"выпало {roll:.2f}) — бот решил не вмешиваться без прямого обращения."
+            )
+            await _save_decision_log(
+                session,
+                group_id,
+                trigger_tg_msg_ids,
+                "ignore",
+                reason,
+                {},
+                {"gate": "chattiness_roll", "chattiness": effective_chattiness, "roll": round(roll, 3)},
+                LLMUsage(),
+            )
+            return BotDecisionResult(action="ignore", reasoning=reason)
+
     # Собираем краткие карточки авторов для быстрого роутера
     author_ids = {m.member_id for m in recent_msgs[-15:] if m.member_id}
     brief_authors = []
@@ -200,15 +237,6 @@ async def evaluate_group_batch_and_decide(
         r_tag = f" (reply->#{m.reply_to_tg_msg_id})" if m.reply_to_tg_msg_id else ""
         new_tag = " [НОВОЕ]" if m.telegram_message_id in trigger_set else ""
         chat_lines.append(f"#{m.telegram_message_id}{new_tag} {who}{r_tag}: {m.text_content}")
-
-    effective_chattiness = g_settings.chattiness_level
-    if (
-        not is_direct_ping
-        and g_settings.quiet_hours_enabled
-        and is_within_quiet_hours(g_settings.timezone, g_settings.quiet_hours_start, g_settings.quiet_hours_end, now_utc)
-    ):
-        # В тихие часы не встреваем сами без веского повода
-        effective_chattiness = round(effective_chattiness * 0.35, 2)
 
     router_user_prompt = (
         f"ГРУППА: {group.title}\n"
