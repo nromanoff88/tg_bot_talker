@@ -34,6 +34,12 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text(
+                "ALTER TABLE group_settings "
+                "ADD COLUMN IF NOT EXISTS new_topic_after_hours DOUBLE PRECISION DEFAULT 4.0"
+            )
+        )
 
     async with AsyncSessionLocal() as session:
         # 1. Инициализация глобальной конфигурации LLM (и синхронизация с .env, если в БД остались пустые/дефолтные поля)

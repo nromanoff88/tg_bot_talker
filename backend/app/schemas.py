@@ -120,6 +120,7 @@ class GroupSettingsSchema(BaseModel):
     proactive_chance_per_hour: float = Field(default=0.15, ge=0.0, le=1.0)
     min_silence_minutes: int = Field(default=90, ge=5, le=10080)
     proactive_cooldown_hours: float = Field(default=8.0, ge=0.5, le=168.0)
+    new_topic_after_hours: float = Field(default=4.0, ge=0.0, le=720.0)
 
     timezone: str = "Europe/Moscow"
     quiet_hours_enabled: bool = True

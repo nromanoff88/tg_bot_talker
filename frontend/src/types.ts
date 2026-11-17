@@ -72,6 +72,7 @@ export interface GroupSettings {
   proactive_chance_per_hour: number;
   min_silence_minutes: number;
   proactive_cooldown_hours: number;
+  new_topic_after_hours: number;
   timezone: string;
   quiet_hours_enabled: boolean;
   quiet_hours_start: string;

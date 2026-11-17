@@ -339,7 +339,7 @@ export function BehaviorPersonaTab({ group, personas, onSaved }: Props) {
           </label>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800">
             <div className="flex justify-between text-xs mb-1.5">
               <span className="text-slate-400">Вероятность начала диалога в час</span>
@@ -383,6 +383,20 @@ export function BehaviorPersonaTab({ group, personas, onSaved }: Props) {
               onChange={(e) => setSettings({ ...settings, proactive_cooldown_hours: Number(e.target.value) })}
               className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white"
             />
+          </div>
+
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">Новая тема, если тишина дольше (часов)</label>
+            <input
+              type="number"
+              step="0.5"
+              min="0"
+              max="720"
+              value={settings.new_topic_after_hours ?? 4}
+              onChange={(e) => setSettings({ ...settings, new_topic_after_hours: Number(e.target.value) })}
+              className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white"
+            />
+            <span className="text-[11px] text-slate-500">Не продолжает старый разговор, а меняет тему</span>
           </div>
         </div>
 

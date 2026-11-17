@@ -28,6 +28,7 @@ async def generate_and_send_proactive_message(
     """Генерирует естественный повод начать диалог в затихшей группе и отправляет через bot-gateway."""
     group = await ensure_group_initialized(session, group_id)
     persona = await resolve_effective_persona(session, group)
+    g_settings = group.settings
 
     recent_stmt = (
         select(Message)
@@ -47,34 +48,58 @@ async def generate_and_send_proactive_message(
     )
     top_members = list((await session.execute(top_members_stmt)).scalars().all())
 
+    now_utc = datetime.now(timezone.utc)
+    last_msg_dt = group.last_message_at or (recent_msgs[-1].created_at if recent_msgs else None)
+    silence_hours = ((now_utc - last_msg_dt).total_seconds() / 3600.0) if last_msg_dt else 999.0
+    threshold_hours = float(getattr(g_settings, "new_topic_after_hours", 4.0) or 0.0)
+    start_new_topic = silence_hours >= threshold_hours
+
     sys_prompt, context_meta = await build_persona_generation_context(
         session=session,
         group=group,
-        recent_messages=recent_msgs,
-        memory_query="интересные обсуждения планы истории участников",
+        recent_messages=recent_msgs if not start_new_topic else [],
+        memory_query="интересные факты хобби работа увлечения участников чата",
     )
+    context_meta["silence_hours"] = round(silence_hours, 2)
+    context_meta["new_topic_mode"] = start_new_topic
 
     member_hooks = []
     for m in top_members:
-        facts_preview = "; ".join(f.fact_text for f in m.facts[:4])
+        facts_preview = "; ".join(f.fact_text for f in m.facts[:5])
         if facts_preview or m.character_summary:
             uname = f" (@{m.username})" if m.username else ""
-            member_hooks.append(f"- {m.display_name}{uname}: {m.character_summary} | Факты: {facts_preview}")
+            nick = f" (в чате: {m.chat_nickname})" if m.chat_nickname else ""
+            member_hooks.append(f"- {m.display_name}{nick}{uname}: {m.character_summary} | Факты: {facts_preview}")
 
     recent_preview = "\n".join(
-        f"[{m.created_at.strftime('%Y-%m-%d %H:%M')}] {m.sender_name}: {m.text_content[:160]}"
-        for m in recent_msgs[-10:]
+        f"[{m.created_at.strftime('%Y-%m-%d %H:%M')}] {m.sender_name}: {m.text_content[:140]}"
+        for m in recent_msgs[-8:]
     )
 
-    user_prompt = (
-        f"В чате «{group.title}» сейчас затишье. Ты решил сам непринуждённо написать в чат и завязать живой разговор.\n\n"
-        f"ЧТО НЕДАВНО ПИСАЛИ В ЧАТЕ:\n{recent_preview or 'Чат пока почти пуст.'}\n\n"
-        f"ЗАЦЕПКИ ПО УЧАСТНИКАМ ГРУППЫ:\n{chr(10).join(member_hooks) or 'Пока мало фактов об участниках.'}\n\n"
-        f"ЗАДАЧА: Напиши ОДНО короткое живое сообщение (1–2 предложения), чтобы естественно оживить чат. "
-        f"Варианты: поинтересоваться у кого-то из ребят, чем закончилась их недавняя история/задача, "
-        f"вбросить жизненный вопрос/наблюдение по тематике группы или поделиться короткой мыслью в своём характере. "
-        f"Без банального «Всем привет! Как дела?»."
-    )
+    if start_new_topic:
+        user_prompt = (
+            f"В чате «{group.title}» тишина уже более {silence_hours:.1f} ч. "
+            f"Предыдущий разговор давно закончился, и ты решил сам закинуть в чат НОВУЮ тему.\n\n"
+            f"О ЧЁМ ГОВОРИЛИ В ПРОШЛЫЙ РАЗ (ТОЛЬКО ДЛЯ СПРАВКИ, ЧТОБЫ НЕ ПОВТОРЯТЬСЯ):\n"
+            f"{recent_preview or 'Чат пока пуст.'}\n\n"
+            f"ДОСЬЕ И ИНТЕРЕСЫ УЧАСТНИКОВ ГРУППЫ:\n"
+            f"{chr(10).join(member_hooks) or 'Пока мало фактов об участниках.'}\n\n"
+            f"СТРОГОЕ ПРАВИЛО: НЕ продолжай и НЕ комментируй старую тему из прошлых сообщений выше — тот разговор уже закрыт!\n"
+            f"ЗАДАЧА: Напиши ОДНО короткое живое сообщение (1–2 предложения) на СОВЕРШЕННО НОВУЮ тему в своём характере. "
+            f"Можешь: вбросить свежий жизненный вопрос/историю/наблюдение по интересам тусовки, "
+            f"или обратиться к кому-то из участников по факту из его досье (не связанному с последним диалогом). "
+            f"Пиши естественно, без штампов вроде «Всем привет! Как дела? Давайте сменим тему»."
+        )
+    else:
+        user_prompt = (
+            f"В чате «{group.title}» небольшая пауза ({silence_hours * 60:.0f} мин). "
+            f"Ты решил сам непринуждённо написать в чат и поддержать или оживить разговор.\n\n"
+            f"ЧТО НЕДАВНО ПИСАЛИ В ЧАТЕ:\n{recent_preview or 'Чат пока почти пуст.'}\n\n"
+            f"ЗАЦЕПКИ ПО УЧАСТНИКАМ ГРУППЫ:\n{chr(10).join(member_hooks) or 'Пока мало фактов об участниках.'}\n\n"
+            f"ЗАДАЧА: Напиши ОДНО короткое живое сообщение (1–2 предложения), чтобы естественно оживить чат. "
+            f"Варианты: развить недавнюю мысль/историю под новым углом, поинтересоваться у кого-то из ребят деталями, "
+            f"или поделиться короткой мыслью в своём характере. Без банального «Всем привет! Как дела?»."
+        )
 
     text_out, usage = await complete_text(
         session=session,
@@ -88,21 +113,25 @@ async def generate_and_send_proactive_message(
     if not text_out:
         return {"status": "empty_response"}
 
-    now_utc = datetime.now(timezone.utc)
     group.last_proactive_at = now_utc
     group.unanswered_initiatives = (group.unanswered_initiatives or 0) + 1
 
+    mode_label = (
+        f"новая тема (тишина {silence_hours:.1f}ч >= {threshold_hours:g}ч)"
+        if start_new_topic
+        else f"продолжение/оживление (тишина {silence_hours:.1f}ч < {threshold_hours:g}ч)"
+    )
     reason = (
-        "Принудительный запуск инициативы администратором из панели."
+        f"Принудительный запуск инициативы из админки: {mode_label}."
         if manual_trigger
-        else "Спонтанная инициатива бота в период затишья чата."
+        else f"Спонтанная инициатива бота в период затишья: {mode_label}."
     )
     log_entry = DecisionLog(
         group_id=group_id,
         trigger_tg_msg_ids=[],
         decision_type="proactive",
         router_reasoning=reason,
-        action_payload={"text": text_out},
+        action_payload={"text": text_out, "new_topic_mode": start_new_topic},
         retrieved_context_meta=context_meta,
         model_used=usage.model,
         prompt_tokens=usage.prompt_tokens,
@@ -129,13 +158,13 @@ async def generate_and_send_proactive_message(
             "id": str(log_entry.id),
             "decision_type": "proactive",
             "router_reasoning": reason,
-            "action_payload": {"text": text_out},
+            "action_payload": {"text": text_out, "new_topic_mode": start_new_topic},
             "model_used": usage.model,
             "cost_usd": usage.cost_usd,
             "created_at": log_entry.created_at.isoformat(),
         },
     )
-    return {"status": "sent", "text": text_out}
+    return {"status": "sent", "text": text_out, "new_topic_mode": start_new_topic}
 
 
 async def check_all_groups_for_proactive_initiative(session: AsyncSession) -> int:
@@ -177,9 +206,12 @@ async def check_all_groups_for_proactive_initiative(session: AsyncSession) -> in
             if hours_since_proactive < s.proactive_cooldown_hours:
                 continue
 
-        # Пересчёт часовой вероятности на 5-минутный тик крона: P_5m = 1 - (1 - P_hour)^(5/60)
-        p_hour = min(0.99, max(0.0, s.proactive_chance_per_hour))
-        p_tick = 1.0 - ((1.0 - p_hour) ** (5.0 / 60.0))
+        # При 100% вероятности срабатываем гарантированно на первом же тике после прохождения условий
+        if s.proactive_chance_per_hour >= 0.999:
+            p_tick = 1.0
+        else:
+            p_hour = max(0.0, s.proactive_chance_per_hour)
+            p_tick = 1.0 - ((1.0 - p_hour) ** (5.0 / 60.0))
 
         if random.random() <= p_tick:
             try:
@@ -190,4 +222,3 @@ async def check_all_groups_for_proactive_initiative(session: AsyncSession) -> in
                 logger.warning("Proactive initiative failed for group %s: %s", g.id, exc)
 
     return triggered
-

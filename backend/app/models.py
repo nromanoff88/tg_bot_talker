@@ -134,6 +134,7 @@ class GroupSettings(Base):
     proactive_chance_per_hour: Mapped[float] = mapped_column(Float, default=0.15)
     min_silence_minutes: Mapped[int] = mapped_column(Integer, default=90)
     proactive_cooldown_hours: Mapped[float] = mapped_column(Float, default=8.0)
+    new_topic_after_hours: Mapped[float] = mapped_column(Float, default=4.0)
 
     timezone: Mapped[str] = mapped_column(String(128), default="Europe/Moscow")
     quiet_hours_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
