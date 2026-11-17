@@ -161,6 +161,7 @@ export const api = {
     groupId: number,
     memberId: string,
     payload: {
+      display_name?: string;
       chat_nickname: string;
       nickname_locked: boolean;
       character_summary: string;
@@ -174,6 +175,13 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
+  mergeMember: (groupId: number, targetMemberId: string, sourceMemberId: string) =>
+    request<GroupMemberDetail>(`/api/groups/${groupId}/members/${targetMemberId}/merge`, {
+      method: 'POST',
+      body: JSON.stringify({ source_member_id: sourceMemberId }),
+    }),
+  deleteMember: (groupId: number, memberId: string) =>
+    request(`/api/groups/${groupId}/members/${memberId}`, { method: 'DELETE' }),
   createFact: (
     groupId: number,
     memberId: string,

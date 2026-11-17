@@ -1,13 +1,13 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth import require_admin
 from app.database import get_db
-from app.models import GroupMember, MemberFact
+from app.models import GroupMember, MemberFact, Message
 from app.schemas import (
     GroupMemberDetailOut,
     GroupMemberOut,
@@ -15,7 +15,9 @@ from app.schemas import (
     MemberFactCreate,
     MemberFactOut,
     MemberFactUpdate,
+    MergeMemberRequest,
 )
+from app.services.import_service import SYNTHETIC_TG_ID_BASE
 
 router = APIRouter(
     prefix="/api/groups/{group_id}/members",
@@ -119,6 +121,8 @@ async def update_member_profile(
     if not mem or mem.group_id != group_id:
         raise HTTPException(status_code=404, detail="Участник не найден в этой группе")
 
+    if payload.display_name is not None and payload.display_name.strip():
+        mem.display_name = payload.display_name.strip()[:255]
     mem.chat_nickname = payload.chat_nickname.strip()
     mem.nickname_locked = payload.nickname_locked
     mem.character_summary = payload.character_summary.strip()
@@ -129,6 +133,120 @@ async def update_member_profile(
 
     await session.commit()
     return await get_member_detail(group_id, member_id, session)
+
+
+@router.post("/{target_member_id}/merge", response_model=GroupMemberDetailOut)
+async def merge_group_members(
+    group_id: int,
+    target_member_id: uuid.UUID,
+    payload: MergeMemberRequest,
+    session: AsyncSession = Depends(get_db),
+) -> GroupMemberDetailOut:
+    """
+    Объединяет карточку-дубль (source_member_id) в целевую карточку (target_member_id):
+    - переносит все сообщения и дедуплицированные факты;
+    - сохраняет реальный telegram_user_id и @username (если у целевой карточки был синтетический ID из HTML);
+    - объединяет пустые поля портрета и заметки админа;
+    - удаляет карточку-дубль.
+    """
+    if payload.source_member_id == target_member_id:
+        raise HTTPException(status_code=400, detail="Нельзя объединить участника самого с собой")
+
+    stmt = (
+        select(GroupMember)
+        .options(selectinload(GroupMember.facts))
+        .where(
+            GroupMember.group_id == group_id,
+            GroupMember.id.in_([target_member_id, payload.source_member_id]),
+        )
+    )
+    rows = {m.id: m for m in (await session.execute(stmt)).scalars().all()}
+    target = rows.get(target_member_id)
+    source = rows.get(payload.source_member_id)
+
+    if not target or not source:
+        raise HTTPException(status_code=404, detail="Один из участников не найден в этой группе")
+
+    # 1. Переносим сообщения с дубля на целевого участника
+    await session.execute(
+        update(Message)
+        .where(Message.group_id == group_id, Message.member_id == source.id)
+        .values(member_id=target.id)
+    )
+
+    # 2. Переносим и дедуплицируем факты
+    target_facts_by_norm = {f.fact_text.strip().lower(): f for f in target.facts}
+    for sf in list(source.facts):
+        norm_txt = sf.fact_text.strip().lower()
+        existing = target_facts_by_norm.get(norm_txt)
+        if existing:
+            if sf.is_pinned and not existing.is_pinned:
+                existing.is_pinned = True
+            if sf.confidence > existing.confidence:
+                existing.confidence = sf.confidence
+            await session.delete(sf)
+        else:
+            sf.member_id = target.id
+            target_facts_by_norm[norm_txt] = sf
+
+    # 3. Объединяем поля портрета и заметки админа
+    if not target.username and source.username:
+        target.username = source.username
+
+    if not target.chat_nickname and source.chat_nickname:
+        target.chat_nickname = source.chat_nickname
+        target.nickname_locked = source.nickname_locked
+
+    if not target.character_summary and source.character_summary:
+        target.character_summary = source.character_summary
+        target.character_locked = source.character_locked
+    elif (
+        target.character_summary
+        and source.character_summary
+        and source.character_summary not in target.character_summary
+        and not target.character_locked
+    ):
+        target.character_summary = f"{target.character_summary}\n{source.character_summary}".strip()
+
+    if not target.bot_attitude and source.bot_attitude:
+        target.bot_attitude = source.bot_attitude
+        target.attitude_locked = source.attitude_locked
+
+    if source.admin_notes and source.admin_notes not in (target.admin_notes or ""):
+        target.admin_notes = f"{target.admin_notes}\n{source.admin_notes}".strip() if target.admin_notes else source.admin_notes
+
+    target.message_count = (target.message_count or 0) + (source.message_count or 0)
+    if source.last_seen_at and (not target.last_seen_at or source.last_seen_at > target.last_seen_at):
+        target.last_seen_at = source.last_seen_at
+
+    # Сохраняем реальный telegram_user_id, если целевая карточка была создана из HTML-импорта
+    real_tg_id_to_adopt: int | None = None
+    if target.telegram_user_id >= SYNTHETIC_TG_ID_BASE and source.telegram_user_id < SYNTHETIC_TG_ID_BASE:
+        real_tg_id_to_adopt = source.telegram_user_id
+
+    # 4. Удаляем карточку-дубль и фиксируем освобождение уникального индекса (group_id, telegram_user_id)
+    await session.delete(source)
+    await session.flush()
+
+    if real_tg_id_to_adopt is not None:
+        target.telegram_user_id = real_tg_id_to_adopt
+
+    await session.commit()
+    return await get_member_detail(group_id, target_member_id, session)
+
+
+@router.delete("/{member_id}")
+async def delete_group_member(
+    group_id: int,
+    member_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+) -> dict:
+    mem = await session.get(GroupMember, member_id)
+    if not mem or mem.group_id != group_id:
+        raise HTTPException(status_code=404, detail="Участник не найден в этой группе")
+    await session.delete(mem)
+    await session.commit()
+    return {"deleted": True}
 
 
 @router.post("/{member_id}/facts", response_model=MemberFactOut)
@@ -178,7 +296,6 @@ async def update_member_fact(
     if payload.is_pinned is not None:
         fact.is_pinned = payload.is_pinned
     elif text_edited:
-        # Автоматически закрепляем факт при ручной правке админом, чтобы ИИ его не затёр
         fact.is_pinned = True
 
     await session.commit()
@@ -199,4 +316,3 @@ async def delete_member_fact(
     await session.delete(fact)
     await session.commit()
     return {"deleted": True}
-

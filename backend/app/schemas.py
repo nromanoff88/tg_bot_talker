@@ -238,6 +238,7 @@ class GroupMemberDetailOut(GroupMemberOut):
 
 
 class GroupMemberUpdate(BaseModel):
+    display_name: Optional[str] = None
     chat_nickname: str = ""
     nickname_locked: bool = False
     character_summary: str = ""
@@ -245,6 +246,10 @@ class GroupMemberUpdate(BaseModel):
     bot_attitude: str = ""
     attitude_locked: bool = False
     admin_notes: str = ""
+
+
+class MergeMemberRequest(BaseModel):
+    source_member_id: uuid.UUID
 
 
 # ==========================================

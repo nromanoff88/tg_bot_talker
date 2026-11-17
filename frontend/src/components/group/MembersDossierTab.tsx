@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Lock, Pin, Plus, Save, Search, Trash2, Unlock } from 'lucide-react';
+import { GitMerge, Lock, Pin, Plus, Save, Search, Trash2, Unlock } from 'lucide-react';
 import { api } from '../../api';
 import type { GroupMember, GroupMemberDetail, MemberFact } from '../../types';
 
@@ -19,6 +19,7 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<GroupMemberDetail | null>(null);
 
+  const [displayName, setDisplayName] = useState('');
   const [nickname, setNickname] = useState('');
   const [nicknameLocked, setNicknameLocked] = useState(false);
   const [character, setCharacter] = useState('');
@@ -26,6 +27,10 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
   const [attitude, setAttitude] = useState('');
   const [attitudeLocked, setAttitudeLocked] = useState(false);
   const [adminNotes, setAdminNotes] = useState('');
+
+  const [showMergeBox, setShowMergeBox] = useState(false);
+  const [mergeSourceId, setMergeSourceId] = useState('');
+  const [merging, setMerging] = useState(false);
 
   const [newFactCat, setNewFactCat] = useState('bio');
   const [newFactText, setNewFactText] = useState('');
@@ -43,8 +48,11 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
   const loadMemberDetail = async (memberId: string) => {
     setSelectedId(memberId);
     setNotice('');
+    setShowMergeBox(false);
+    setMergeSourceId('');
     const d = await api.getMember(groupId, memberId);
     setDetail(d);
+    setDisplayName(d.display_name);
     setNickname(d.chat_nickname);
     setNicknameLocked(d.nickname_locked);
     setCharacter(d.character_summary);
@@ -67,6 +75,7 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
     setNotice('');
     try {
       const updated = await api.updateMember(groupId, detail.id, {
+        display_name: displayName,
         chat_nickname: nickname,
         nickname_locked: nicknameLocked,
         character_summary: character,
@@ -83,6 +92,50 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleMergeDuplicate = async () => {
+    if (!detail || !mergeSourceId) return;
+    const sourceMember = members.find((m) => m.id === mergeSourceId);
+    if (!sourceMember) return;
+    if (
+      !confirm(
+        `Объединить карточку «${sourceMember.display_name}» (${sourceMember.message_count} сообщ., ${sourceMember.facts_count} факт.) в текущий профиль «${detail.display_name}»?\n\nВсе сообщения, факты и реальный Telegram ID будут перенесены сюда, а дубль удалён.`
+      )
+    ) {
+      return;
+    }
+    setMerging(true);
+    setNotice('');
+    try {
+      const merged = await api.mergeMember(groupId, detail.id, mergeSourceId);
+      setDetail(merged);
+      setDisplayName(merged.display_name);
+      setNickname(merged.chat_nickname);
+      setNicknameLocked(merged.nickname_locked);
+      setCharacter(merged.character_summary);
+      setCharacterLocked(merged.character_locked);
+      setAttitude(merged.bot_attitude);
+      setAttitudeLocked(merged.attitude_locked);
+      setAdminNotes(merged.admin_notes);
+      setShowMergeBox(false);
+      setMergeSourceId('');
+      await loadList();
+      setNotice(`Профиль «${sourceMember.display_name}» успешно объединён с этой карточкой!`);
+    } catch (err: any) {
+      setNotice(`Ошибка объединения: ${err.message}`);
+    } finally {
+      setMerging(false);
+    }
+  };
+
+  const handleDeleteMember = async () => {
+    if (!detail) return;
+    if (!confirm(`Удалить карточку участника «${detail.display_name}» и все его факты?`)) return;
+    await api.deleteMember(groupId, detail.id);
+    setSelectedId(null);
+    setDetail(null);
+    await loadList();
   };
 
   const handleAddFact = async (e: React.FormEvent) => {
@@ -127,6 +180,8 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
     );
   });
 
+  const otherMembers = members.filter((m) => m.id !== detail?.id);
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
       {/* Список участников чата */}
@@ -148,31 +203,36 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
               Участники появятся, как только напишут в группу или после импорта истории чата.
             </div>
           ) : (
-            filteredMembers.map((m) => (
-              <div
-                key={m.id}
-                onClick={() => loadMemberDetail(m.id)}
-                className={`p-3 rounded-xl border transition cursor-pointer ${
-                  selectedId === m.id
-                    ? 'bg-indigo-600/15 border-indigo-500/50'
-                    : 'bg-slate-950 border-slate-800 hover:border-slate-700'
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="font-medium text-xs text-white truncate">
-                    {m.display_name}
-                    {m.chat_nickname && <span className="text-indigo-300 ml-1">({m.chat_nickname})</span>}
+            filteredMembers.map((m) => {
+              const isSynthetic = m.telegram_user_id >= 9000000000000;
+              return (
+                <div
+                  key={m.id}
+                  onClick={() => loadMemberDetail(m.id)}
+                  className={`p-3 rounded-xl border transition cursor-pointer ${
+                    selectedId === m.id
+                      ? 'bg-indigo-600/15 border-indigo-500/50'
+                      : 'bg-slate-950 border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="font-medium text-xs text-white truncate">
+                      {m.display_name}
+                      {m.chat_nickname && <span className="text-indigo-300 ml-1">({m.chat_nickname})</span>}
+                    </div>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 shrink-0">
+                      {m.facts_count} факт.
+                    </span>
                   </div>
-                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 shrink-0">
-                    {m.facts_count} факт.
-                  </span>
+                  <div className="flex items-center justify-between text-[11px] text-slate-500 mt-1">
+                    <span>
+                      {m.username ? `@${m.username}` : isSynthetic ? 'импорт HTML' : `tg:${m.telegram_user_id}`}
+                    </span>
+                    <span>{m.message_count} сообщ.</span>
+                  </div>
                 </div>
-                <div className="flex items-center justify-between text-[11px] text-slate-500 mt-1">
-                  <span>{m.username ? `@${m.username}` : `tg:${m.telegram_user_id}`}</span>
-                  <span>{m.message_count} сообщ.</span>
-                </div>
-              </div>
-            ))
+              );
+            })
           )}
         </div>
       </div>
@@ -186,19 +246,84 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
                 <div>
                   <h3 className="text-base font-semibold text-white">{detail.display_name}</h3>
                   <div className="text-xs text-slate-400">
-                    {detail.username ? `@${detail.username} • ` : ''}Telegram ID: {detail.telegram_user_id} • Сообщений
-                    в этой группе: {detail.message_count}
+                    {detail.username ? `@${detail.username} • ` : ''}
+                    {detail.telegram_user_id >= 9000000000000
+                      ? 'Импортированный профиль (HTML)'
+                      : `Telegram ID: ${detail.telegram_user_id}`}{' '}
+                    • Сообщений в этой группе: {detail.message_count}
                   </div>
                 </div>
-                <span className="text-[11px] px-2.5 py-1 rounded-lg bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">
-                  Строго изолировано внутри этой группы
-                </span>
+
+                <div className="flex items-center gap-2">
+                  {otherMembers.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowMergeBox(!showMergeBox)}
+                      className="px-3 py-1.5 rounded-xl bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 text-indigo-300 text-xs font-medium flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <GitMerge className="w-3.5 h-3.5" />
+                      Объединить с дублем
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleDeleteMember}
+                    className="p-1.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 cursor-pointer"
+                    title="Удалить эту карточку участника"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* Панель слияния дубликатов */}
+              {showMergeBox && (
+                <div className="p-4 rounded-xl bg-slate-950 border border-indigo-500/40 space-y-3">
+                  <div className="text-xs text-slate-300">
+                    Выбери карточку-дубль, которую нужно **влить в текущий профиль «{detail.display_name}»** (все её
+                    сообщения, факты и реальный Telegram ID перенесутся сюда, а дубль удалится):
+                  </div>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <select
+                      value={mergeSourceId}
+                      onChange={(e) => setMergeSourceId(e.target.value)}
+                      className="flex-1 px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-white"
+                    >
+                      <option value="">-- Выберите дубль для слияния --</option>
+                      {otherMembers.map((om) => (
+                        <option key={om.id} value={om.id}>
+                          {om.display_name} {om.username ? `(@${om.username})` : ''} — {om.message_count} сообщ.,{' '}
+                          {om.facts_count} факт.
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={!mergeSourceId || merging}
+                      onClick={handleMergeDuplicate}
+                      className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-xs font-medium text-white flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <GitMerge className="w-3.5 h-3.5" />
+                      {merging ? 'Объединяем...' : 'Влить в эту карточку'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Отображаемое имя</label>
+                  <input
+                    type="text"
+                    value={displayName}
+                    onChange={(e) => setDisplayName(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white"
+                  />
+                </div>
+
                 <div>
                   <div className="flex items-center justify-between mb-1">
-                    <label className="text-xs text-slate-400">Как зовут / обращаются в чате</label>
+                    <label className="text-xs text-slate-400">Как зовут в чате</label>
                     <button
                       type="button"
                       onClick={() => setNicknameLocked(!nicknameLocked)}
@@ -217,14 +342,14 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
                       setNickname(e.target.value);
                       setNicknameLocked(true);
                     }}
-                    placeholder="Например: Серёга, Шеф, Михалыч..."
+                    placeholder="Серёга, Шеф..."
                     className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white"
                   />
                 </div>
 
                 <div>
                   <div className="flex items-center justify-between mb-1">
-                    <label className="text-xs text-slate-400">Отношение бота к участнику</label>
+                    <label className="text-xs text-slate-400">Отношение бота</label>
                     <button
                       type="button"
                       onClick={() => setAttitudeLocked(!attitudeLocked)}
@@ -243,7 +368,7 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
                       setAttitude(e.target.value);
                       setAttitudeLocked(true);
                     }}
-                    placeholder="Например: подкалываем друг друга по-доброму, уважаю его экспертизу"
+                    placeholder="свой парень, подкалываем..."
                     className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white"
                   />
                 </div>
@@ -398,4 +523,3 @@ export function MembersDossierTab({ groupId }: { groupId: number }) {
     </div>
   );
 }
-
