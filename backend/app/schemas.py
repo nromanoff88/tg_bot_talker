@@ -327,6 +327,27 @@ class ManualSendMessageRequest(BaseModel):
     reply_to_tg_msg_id: Optional[int] = None
 
 
+class PollPayloadSchema(BaseModel):
+    question: str = Field(min_length=1, max_length=300)
+    options: list[str] = Field(min_length=2, max_length=10)
+    is_anonymous: bool = False
+    type: Literal["regular", "quiz"] = "regular"
+    allows_multiple_answers: bool = False
+    correct_option_id: Optional[int] = None
+    explanation: Optional[str] = Field(default=None, max_length=200)
+    open_period: Optional[int] = Field(default=None, ge=5, le=600)
+    is_closed: bool = False
+    protect_content: bool = False
+    reply_to_tg_msg_id: Optional[int] = None
+
+
+class GeneratePollRequest(BaseModel):
+    topic_hint: str = ""
+    type: Literal["regular", "quiz"] = "regular"
+    is_anonymous: bool = False
+    allows_multiple_answers: bool = False
+
+
 class ImportHistoryResponse(BaseModel):
     imported_messages: int
     skipped_duplicates: int

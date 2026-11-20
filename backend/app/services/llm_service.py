@@ -349,7 +349,7 @@ def _extract_json_dict(raw_text: str) -> dict[str, Any]:
 
     # Regex fallback для классификатора решений, если модель выдала совсем нестандартно экранированный JSON
     fallback: dict[str, Any] = {}
-    m_act = re.search(r'"action"\s*:\s*"(ignore|react|reply|message)"', text, flags=re.IGNORECASE)
+    m_act = re.search(r'"action"\s*:\s*"(ignore|react|reply|message|poll)"', text, flags=re.IGNORECASE)
     if m_act:
         fallback["action"] = m_act.group(1).lower()
     m_tid = re.search(r'"target_tg_msg_id"\s*:\s*(\d+)', text)

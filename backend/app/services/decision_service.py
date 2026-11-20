@@ -64,12 +64,168 @@ def humanize_bot_text(text: str, persona_name: str = "") -> str:
 
 @dataclass
 class BotDecisionResult:
-    action: Literal["ignore", "react", "reply", "message"]
+    action: Literal["ignore", "react", "reply", "message", "poll"]
     target_tg_msg_id: Optional[int] = None
     emoji: Optional[str] = None
     text: Optional[str] = None
+    poll_data: Optional[dict[str, Any]] = None
     simulate_typing: bool = True
     reasoning: str = ""
+
+
+def sanitize_poll_params(raw: dict[str, Any]) -> dict[str, Any]:
+    """Нормализует параметры опроса под ограничения Telegram Bot API sendPoll."""
+    question = str(raw.get("question") or "").strip()[:300]
+    if not question:
+        question = "Голосование в чате"
+
+    raw_opts = raw.get("options") or []
+    options: list[str] = []
+    seen: set[str] = set()
+    for item in raw_opts:
+        opt = str(item or "").strip()[:100]
+        if opt and opt.lower() not in seen:
+            options.append(opt)
+            seen.add(opt.lower())
+        if len(options) >= 10:
+            break
+
+    while len(options) < 2:
+        fallback_opt = "Да" if len(options) == 0 else "Нет"
+        if fallback_opt.lower() in seen:
+            fallback_opt = f"Вариант {len(options) + 1}"
+        options.append(fallback_opt)
+        seen.add(fallback_opt.lower())
+
+    poll_type = str(raw.get("type") or "regular").strip().lower()
+    if poll_type not in ("regular", "quiz"):
+        poll_type = "regular"
+
+    is_anonymous = bool(raw.get("is_anonymous", False))
+    is_closed = bool(raw.get("is_closed", False))
+    protect_content = bool(raw.get("protect_content", False))
+
+    raw_open_period = raw.get("open_period")
+    open_period: Optional[int] = None
+    if isinstance(raw_open_period, (int, float)) and not isinstance(raw_open_period, bool):
+        val = int(raw_open_period)
+        if val >= 5:
+            open_period = min(600, max(5, val))
+
+    if poll_type == "quiz":
+        allows_multiple = False
+        raw_correct = raw.get("correct_option_id")
+        if isinstance(raw_correct, (int, str)) and str(raw_correct).lstrip("-").isdigit():
+            idx = int(raw_correct)
+            correct_option_id: Optional[int] = idx if 0 <= idx < len(options) else 0
+        else:
+            correct_option_id = 0
+        raw_expl = str(raw.get("explanation") or "").strip()[:200]
+        explanation: Optional[str] = raw_expl or None
+    else:
+        allows_multiple = bool(raw.get("allows_multiple_answers", False))
+        correct_option_id = None
+        explanation = None
+
+    reply_to = raw.get("reply_to_tg_msg_id")
+    reply_to_int = int(reply_to) if isinstance(reply_to, int) and not isinstance(reply_to, bool) else None
+
+    return {
+        "question": question,
+        "options": options,
+        "is_anonymous": is_anonymous,
+        "type": poll_type,
+        "allows_multiple_answers": allows_multiple,
+        "correct_option_id": correct_option_id,
+        "explanation": explanation,
+        "open_period": open_period,
+        "is_closed": is_closed,
+        "protect_content": protect_content,
+        "reply_to_tg_msg_id": reply_to_int,
+    }
+
+
+async def generate_poll_via_llm(
+    session: AsyncSession,
+    group_id: int,
+    recent_msgs: Optional[list[Message]] = None,
+    topic_hint: str = "",
+    preferred_type: Optional[str] = None,
+    preferred_anonymous: Optional[bool] = None,
+    preferred_multiple: Optional[bool] = None,
+) -> tuple[dict[str, Any], dict[str, Any], LLMUsage]:
+    """Генерирует параметры Telegram-опроса в стиле Персоны группы и её текущего контекста."""
+    group = await ensure_group_initialized(session, group_id)
+    persona = await resolve_effective_persona(session, group)
+
+    if recent_msgs is None:
+        recent_stmt = (
+            select(Message)
+            .where(Message.group_id == group_id)
+            .order_by(Message.created_at.desc())
+            .limit(20)
+        )
+        recent_msgs = list(reversed((await session.execute(recent_stmt)).scalars().all()))
+
+    sys_prompt, context_meta = await build_persona_generation_context(
+        session=session,
+        group=group,
+        recent_messages=recent_msgs,
+        memory_query=topic_hint or (recent_msgs[-1].text_content[:200] if recent_msgs else ""),
+    )
+
+    chat_lines = []
+    for m in recent_msgs[-20:]:
+        who = f"{persona['display_name']} (ТЫ)" if m.is_from_bot else m.sender_name
+        chat_lines.append(f"#{m.telegram_message_id} {who}: {m.text_content}")
+
+    hints_lines = []
+    if topic_hint:
+        hints_lines.append(f"- Пожелание/повод к опросу: {topic_hint}")
+    if preferred_type in ("regular", "quiz"):
+        hints_lines.append(f"- Желаемый тип: {preferred_type}")
+    if preferred_anonymous is not None:
+        hints_lines.append(f"- Анонимность: {preferred_anonymous}")
+    if preferred_multiple is not None:
+        hints_lines.append(f"- Множественный выбор: {preferred_multiple}")
+
+    user_prompt = (
+        f"ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ:\n{chr(10).join(chat_lines) or 'Пока нет сообщений.'}\n\n"
+        + (f"УКАЗАНИЯ ПО ПАРАМЕТРАМ:\n{chr(10).join(hints_lines)}\n\n" if hints_lines else "")
+        + """ЗАДАЧА: Придумай живой, естественный опрос или викторину в Telegram в своём характере (без официоза и канцелярита).
+Если участники в чате прямо указали параметры (например, «анонимный», «несколько вариантов», «викторина», «таймер 60 сек»), обязательно учти их.
+
+Верни СТРОГО JSON следующей структуры:
+{
+  "question": "Вопрос опроса (до 300 символов)",
+  "options": ["Вариант 1", "Вариант 2", "Вариант 3"],
+  "type": "regular | quiz",
+  "is_anonymous": false,
+  "allows_multiple_answers": false,
+  "correct_option_id": 0,
+  "explanation": "Короткое пояснение правильного ответа только если type=quiz (до 200 символов), иначе null",
+  "open_period": null
+}
+Ограничения Telegram API: от 2 до 10 вариантов ответа (каждый до 100 символов). Для quiz allows_multiple_answers всегда false, а correct_option_id — индекс правильного ответа (0..N-1). Для open_period укажи число 5..600 только если нужен автотаймер, иначе null."""
+    )
+
+    raw_poll, usage = await complete_json(
+        session=session,
+        tier="smart",
+        system_prompt=sys_prompt,
+        user_prompt=user_prompt,
+        temperature=0.75,
+        max_tokens=1600,
+    )
+    if preferred_type in ("regular", "quiz"):
+        raw_poll["type"] = preferred_type
+    if preferred_anonymous is not None:
+        raw_poll["is_anonymous"] = preferred_anonymous
+    if preferred_multiple is not None and raw_poll.get("type") != "quiz":
+        raw_poll["allows_multiple_answers"] = preferred_multiple
+
+    sanitized = sanitize_poll_params(raw_poll)
+    return sanitized, context_meta, usage
 
 
 ROUTER_SYSTEM_PROMPT = """Ты — внутренний фильтр социальной уместности живого участника группового чата Telegram.
@@ -78,13 +234,14 @@ ROUTER_SYSTEM_PROMPT = """Ты — внутренний фильтр социа�
 2. "react" — просто поставить эмодзи-реакцию на конкретное сообщение (когда шутка смешная, новость классная или хочется поддержать без лишних слов).
 3. "reply" — ответить реплаем на конкретное сообщение (когда обратились к тебе, задали интересный вопрос, пошла близкая тебе тема или уместно вставить живой комментарий).
 4. "message" — написать в общий поток без привязки к одному сообщению (когда комментируешь сразу весь диалог нескольких людей).
+5. "poll" — создать нативный опрос или викторину в Telegram (выбирай, когда участники просят сделать опрос/голосование/викторину или когда в живом споре/выборе планов действительно уместно запустить голосование в чате).
 
 Учитывай параметр `chattiness_level` (от 0.0 — почти всегда молчит, до 1.0 — очень разговорчивый душа компании).
-Если `is_direct_ping = true` (тебя упомянули или ответили на твоё сообщение), почти всегда выбирай "reply" (кроме совсем пустых «ок/понял», где уместна реакция "react" или "ignore").
+Если `is_direct_ping = true` (тебя упомянули или ответили на твоё сообщение), почти всегда выбирай "reply" (или "poll", если прямо просят создать опрос/голосование/викторину).
 
 Верни СТРОГО JSON:
 {
-  "action": "ignore | react | reply | message",
+  "action": "ignore | react | reply | message | poll",
   "target_tg_msg_id": 12345,
   "emoji": "🔥",
   "need_memory_search": false,
@@ -260,7 +417,7 @@ async def evaluate_group_batch_and_decide(
     )
 
     raw_action = str(router_json.get("action") or "ignore").strip().lower()
-    if raw_action not in ("ignore", "react", "reply", "message"):
+    if raw_action not in ("ignore", "react", "reply", "message", "poll"):
         raw_action = "ignore"
 
     reasoning = str(router_json.get("reasoning") or "Решение принято классификатором.").strip()
@@ -311,6 +468,37 @@ async def evaluate_group_batch_and_decide(
             action="react",
             target_tg_msg_id=target_msg_id,
             emoji=chosen_emoji,
+            reasoning=reasoning,
+        )
+
+    # Ветка 2.5: Создать опрос или викторину в группе
+    if raw_action == "poll":
+        poll_data, poll_ctx_meta, poll_usage = await generate_poll_via_llm(
+            session=session,
+            group_id=group_id,
+            recent_msgs=recent_msgs,
+            topic_hint=f"{reasoning} | Последняя реплика: {trigger_msgs[-1].text_content[:200]}",
+        )
+        poll_ctx_meta["is_direct_ping"] = is_direct_ping
+        poll_ctx_meta["router_action"] = "poll"
+        total_usage = router_usage + poll_usage
+        reply_id = target_msg_id if is_direct_ping else None
+
+        await _save_decision_log(
+            session,
+            group_id,
+            trigger_tg_msg_ids,
+            "poll",
+            reasoning,
+            {"poll": poll_data, "target_tg_msg_id": reply_id},
+            poll_ctx_meta,
+            total_usage,
+        )
+        return BotDecisionResult(
+            action="poll",
+            target_tg_msg_id=reply_id,
+            poll_data=poll_data,
+            simulate_typing=g_settings.simulate_typing,
             reasoning=reasoning,
         )
 

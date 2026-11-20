@@ -14,7 +14,7 @@ from app.config import get_settings
 from app.database import AsyncSessionLocal, init_db
 from app.models import DecisionLog, Message, SystemConfig
 from app.redis_client import BOT_COMMANDS_CHANNEL, get_redis, publish_group_event
-from app.services.decision_service import evaluate_group_batch_and_decide
+from app.services.decision_service import evaluate_group_batch_and_decide, sanitize_poll_params
 from app.services.memory_service import ensure_group_initialized, resolve_effective_persona
 
 logging.basicConfig(
@@ -100,6 +100,100 @@ async def send_and_record_bot_message(
         return db_msg
 
 
+async def send_and_record_bot_poll(
+    bot: Bot,
+    group_id: int,
+    poll_data: dict[str, Any],
+    reply_to_tg_msg_id: Optional[int] = None,
+    simulate_typing: bool = True,
+) -> Optional[Message]:
+    """Отправляет опрос/викторину в Telegram со всеми параметрами и сохраняет запись в БД."""
+    clean = sanitize_poll_params(poll_data)
+    effective_reply_id = reply_to_tg_msg_id if reply_to_tg_msg_id is not None else clean.get("reply_to_tg_msg_id")
+
+    if simulate_typing:
+        try:
+            await bot.send_chat_action(chat_id=group_id, action=ChatAction.TYPING)
+        except Exception as exc:
+            logger.debug("send_chat_action failed: %s", exc)
+        await asyncio.sleep(1.5)
+
+    try:
+        reply_params = (
+            ReplyParameters(message_id=effective_reply_id, allow_sending_without_reply=True)
+            if effective_reply_id is not None
+            else None
+        )
+        send_kwargs: dict[str, Any] = {
+            "chat_id": group_id,
+            "question": clean["question"],
+            "options": clean["options"],
+            "is_anonymous": clean["is_anonymous"],
+            "type": clean["type"],
+            "allows_multiple_answers": clean["allows_multiple_answers"],
+            "is_closed": clean["is_closed"],
+            "protect_content": clean["protect_content"],
+            "reply_parameters": reply_params,
+        }
+        if clean["type"] == "quiz":
+            send_kwargs["correct_option_id"] = clean["correct_option_id"]
+            if clean["explanation"]:
+                send_kwargs["explanation"] = clean["explanation"]
+        if clean["open_period"] is not None:
+            send_kwargs["open_period"] = clean["open_period"]
+
+        sent = await bot.send_poll(**send_kwargs)
+    except Exception as exc:
+        logger.error("Failed to send poll to group %s: %s", group_id, exc)
+        return None
+
+    poll_tag = "ВИКТОРИНА" if clean["type"] == "quiz" else "ОПРОС"
+    text_repr = f"[{poll_tag}: {clean['question']} | Варианты: {', '.join(clean['options'])}]"
+    now_utc = datetime.now(timezone.utc)
+
+    async with AsyncSessionLocal() as session:
+        group = await ensure_group_initialized(session, group_id)
+        persona = await resolve_effective_persona(session, group)
+        sys_cfg = await session.get(SystemConfig, 1)
+
+        db_msg = Message(
+            group_id=group_id,
+            telegram_message_id=sent.message_id,
+            member_id=None,
+            sender_name=persona.get("display_name") or (sys_cfg.bot_display_name if sys_cfg else "Бот") or "Бот",
+            sender_username=sys_cfg.bot_username if sys_cfg else None,
+            is_from_bot=True,
+            reply_to_tg_msg_id=effective_reply_id,
+            text_content=text_repr,
+            reactions={},
+            is_imported=False,
+            is_processed_for_memory=False,
+            created_at=now_utc,
+        )
+        session.add(db_msg)
+        group.last_bot_message_at = now_utc
+        group.last_message_at = now_utc
+        group.unanalyzed_msg_count = (group.unanalyzed_msg_count or 0) + 1
+        await session.commit()
+
+        await publish_group_event(
+            group_id,
+            "new_message",
+            {
+                "id": db_msg.id,
+                "telegram_message_id": db_msg.telegram_message_id,
+                "sender_name": db_msg.sender_name,
+                "sender_username": db_msg.sender_username,
+                "is_from_bot": True,
+                "reply_to_tg_msg_id": db_msg.reply_to_tg_msg_id,
+                "text_content": db_msg.text_content,
+                "reactions": {},
+                "created_at": db_msg.created_at.isoformat(),
+            },
+        )
+        return db_msg
+
+
 async def _process_single_debounced_group(bot: Bot, group_id: int, trigger_ids: list[int]) -> None:
     try:
         async with AsyncSessionLocal() as session:
@@ -122,6 +216,14 @@ async def _process_single_debounced_group(bot: Bot, group_id: int, trigger_ids: 
                 group_id=group_id,
                 text=decision.text,
                 reply_to_tg_msg_id=decision.target_tg_msg_id if decision.action == "reply" else None,
+                simulate_typing=decision.simulate_typing,
+            )
+        elif decision.action == "poll" and decision.poll_data:
+            await send_and_record_bot_poll(
+                bot=bot,
+                group_id=group_id,
+                poll_data=decision.poll_data,
+                reply_to_tg_msg_id=decision.target_tg_msg_id,
                 simulate_typing=decision.simulate_typing,
             )
     except Exception as exc:
@@ -208,6 +310,46 @@ async def redis_commands_listener_loop(bot: Bot) -> None:
                             )
                             session.add(log_entry)
                             await session.commit()
+                elif cmd == "send_poll":
+                    gid = int(data["group_id"])
+                    poll_payload = data.get("poll") or {}
+                    reply_id = data.get("reply_to_tg_msg_id")
+                    sim_typing = bool(data.get("simulate_typing", False))
+                    source = str(data.get("source") or "manual")
+
+                    sent_msg = await send_and_record_bot_poll(
+                        bot=bot,
+                        group_id=gid,
+                        poll_data=poll_payload,
+                        reply_to_tg_msg_id=int(reply_id) if reply_id else None,
+                        simulate_typing=sim_typing,
+                    )
+                    if source == "manual" and sent_msg is not None:
+                        async with AsyncSessionLocal() as session:
+                            log_entry = DecisionLog(
+                                group_id=gid,
+                                trigger_tg_msg_ids=[int(reply_id)] if reply_id else [],
+                                decision_type="poll",
+                                router_reasoning="Опрос создан вручную администратором из веб-панели.",
+                                action_payload={"poll": poll_payload, "target_tg_msg_id": reply_id},
+                                retrieved_context_meta={},
+                                model_used="admin-manual",
+                            )
+                            session.add(log_entry)
+                            await session.commit()
+                            await publish_group_event(
+                                gid,
+                                "decision_logged",
+                                {
+                                    "id": str(log_entry.id),
+                                    "decision_type": "poll",
+                                    "router_reasoning": log_entry.router_reasoning,
+                                    "action_payload": log_entry.action_payload,
+                                    "model_used": "admin-manual",
+                                    "cost_usd": 0.0,
+                                    "created_at": log_entry.created_at.isoformat(),
+                                },
+                            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

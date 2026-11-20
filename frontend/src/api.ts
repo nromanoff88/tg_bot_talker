@@ -2,6 +2,7 @@ import type {
   ChatMessage,
   DashboardStats,
   DecisionLog,
+  GeneratePollRequest,
   GroupContext,
   GroupDetail,
   GroupMember,
@@ -13,6 +14,7 @@ import type {
   MemoryEpisode,
   PersonaOverride,
   PersonaTemplate,
+  PollPayload,
   SystemConfig,
 } from './types';
 
@@ -213,6 +215,16 @@ export const api = {
     request(`/api/groups/${groupId}/actions/send-message`, {
       method: 'POST',
       body: JSON.stringify({ text, reply_to_tg_msg_id }),
+    }),
+  sendPoll: (groupId: number, payload: PollPayload) =>
+    request<{ queued: boolean; poll: PollPayload }>(`/api/groups/${groupId}/actions/send-poll`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  generatePollDraft: (groupId: number, payload: GeneratePollRequest) =>
+    request<PollPayload>(`/api/groups/${groupId}/actions/generate-poll`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }),
   forceAnalyzeMemory: (groupId: number) =>
     request<{ queued: boolean; message: string }>(`/api/groups/${groupId}/actions/analyze-memory`, {

@@ -12,6 +12,7 @@ from app.database import get_db
 from app.models import Group, GroupMember, MemoryEpisode, Message
 from app.redis_client import get_arq_pool, publish_bot_command
 from app.schemas import (
+    GeneratePollRequest,
     GroupContextSchema,
     GroupDetailOut,
     GroupPersonaConfigUpdate,
@@ -22,7 +23,9 @@ from app.schemas import (
     MemoryEpisodeCreate,
     MemoryEpisodeOut,
     MemoryEpisodeUpdate,
+    PollPayloadSchema,
 )
+from app.services.decision_service import generate_poll_via_llm, sanitize_poll_params
 from app.services.import_service import import_telegram_desktop_files
 from app.services.llm_service import create_embedding
 from app.services.memory_service import (
@@ -347,6 +350,48 @@ async def manual_send_message(
         }
     )
     return {"queued": True}
+
+
+@router.post("/{group_id}/actions/send-poll")
+async def manual_send_poll(
+    group_id: int,
+    payload: PollPayloadSchema,
+    session: AsyncSession = Depends(get_db),
+) -> dict:
+    group = await session.get(Group, group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Группа не найдена")
+
+    clean_poll = sanitize_poll_params(payload.model_dump())
+    await publish_bot_command(
+        {
+            "command": "send_poll",
+            "group_id": group_id,
+            "poll": clean_poll,
+            "reply_to_tg_msg_id": clean_poll.get("reply_to_tg_msg_id"),
+            "simulate_typing": False,
+            "source": "manual",
+        }
+    )
+    return {"queued": True, "poll": clean_poll}
+
+
+@router.post("/{group_id}/actions/generate-poll", response_model=PollPayloadSchema)
+async def generate_poll_draft(
+    group_id: int,
+    payload: GeneratePollRequest,
+    session: AsyncSession = Depends(get_db),
+) -> PollPayloadSchema:
+    await ensure_group_initialized(session, group_id)
+    poll_data, _, _ = await generate_poll_via_llm(
+        session=session,
+        group_id=group_id,
+        topic_hint=payload.topic_hint.strip(),
+        preferred_type=payload.type,
+        preferred_anonymous=payload.is_anonymous,
+        preferred_multiple=payload.allows_multiple_answers,
+    )
+    return PollPayloadSchema(**poll_data)
 
 
 @router.post("/{group_id}/actions/analyze-memory")

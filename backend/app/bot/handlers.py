@@ -50,6 +50,9 @@ async def handle_my_chat_member(event: ChatMemberUpdated) -> None:
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_group_message(message: TgMessage) -> None:
     text_content = (message.text or message.caption or "").strip()
+    if not text_content and message.poll:
+        opts_preview = ", ".join(o.text for o in message.poll.options)
+        text_content = f"[Опрос: {message.poll.question} | Варианты: {opts_preview}]"
     if not text_content:
         return
 

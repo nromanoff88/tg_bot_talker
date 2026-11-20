@@ -206,3 +206,24 @@ export interface ImportHistoryResult {
   queued_analysis_batches: number;
 }
 
+export interface PollPayload {
+  question: string;
+  options: string[];
+  is_anonymous: boolean;
+  type: 'regular' | 'quiz';
+  allows_multiple_answers: boolean;
+  correct_option_id: number | null;
+  explanation: string | null;
+  open_period: number | null;
+  is_closed: boolean;
+  protect_content: boolean;
+  reply_to_tg_msg_id: number | null;
+}
+
+export interface GeneratePollRequest {
+  topic_hint: string;
+  type: 'regular' | 'quiz';
+  is_anonymous: boolean;
+  allows_multiple_answers: boolean;
+}
+
