@@ -118,7 +118,7 @@ async def search_relevant_episodes(
     if not query or not query.strip():
         return []
 
-    query_vec = await create_embedding(session, query)
+    query_vec = await create_embedding(session, query, emb_type="query")
     if query_vec is not None:
         distance_expr = MemoryEpisode.embedding.cosine_distance(query_vec)
         stmt = (
@@ -247,6 +247,7 @@ async def build_persona_generation_context(
 - Никогда не пиши как ассистент поддержки, не предлагай «помочь разобраться» и не ставь нумерованные/маркированные списки.
 - Не начинай ответ с имени собеседника и запятой в каждом сообщении, если и так делаешь реплай.
 - Отвечай только текстом самого сообщения (без кавычек вокруг ответа и без префикса со своим именем).
+- Не зацикливайся на одних и тех же старых шутках или присказках (не повторяй в каждом сообщении счётчик «чайников», «баранов», «Приору» или одну и ту же шутку, если собеседник сам про это не заговорил). Отвечай живым языком по сути текущей темы.
 
 ПРИМЕРЫ ТВОЕЙ ЖИВОЙ РЕЧИ:
 {examples_block or '- общайся коротко, метко и по-человечески'}
@@ -282,15 +283,19 @@ MEMORY_EXTRACTION_SYSTEM_PROMPT = """Ты — аналитик социальн�
 
 КРИТИЧЕСКИЕ ПРАВИЛА:
 - Все пометки [LOCKED BY ADMIN] являются абсолютной истиной: НЕ дублируй их и НЕ пытайся их опровергнуть.
-- Извлекай только реальные факты о людях из их слов и контекста (работа, город, хобби, вкусы, характер, жизненные события, взгляды, манера речи). Не выдумывай то, чего не было!
-- Пиши всё лаконично на русском языке.
+- В new_facts участников записывай ТОЛЬКО долгосрочные реальные факты о самом человеке (работа, профессия, семья, отношения, хобби, техника/машина, город, реальные привычки, вкусы и взгляды). Если в пачке нет таких новых фактов о человеке — верни "new_facts": [].
+- КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО записывать в new_facts участников:
+  • выдумки, ролевые шутки и фантазии самого [БОТ] (например: «должен боту 5 чайников и 3 барана», «тонированная Приора бота» и т.п.);
+  • одноразовые ситуативные реплики, пинги, тестовые команды и ругань/подколы в адрес бота (например: «обозвал бота», «спросил у бота сколько градусов», «велел боту молчать», «урезал болтливость до 5%», «тестирует бота»).
+- В new_jokes_or_rules КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО записывать собственные повторяющиеся присказки [БОТ] («новое слово за сессию = чайник», «баран с Егора», однотипные шутки бота про себя самого). Фиксируй только 0–1 реальный устойчивый мем или правило самих участников группы, если такой действительно появился в пачке.
+- Не выдумывай то, чего не было, и пиши всё лаконично на русском языке.
 
 Верни строго валидный JSON следующего формата:
 {
   "group_summary_update": "обновлённое краткое описание атмосферы и тематики группы (2-4 предложения) или пустая строка, если менять не нужно",
   "active_topics": ["тема 1", "тема 2"],
   "new_jokes_or_rules": [
-    {"kind": "meme", "text": "описание локальной шутки, сленга или негласного правила"}
+    {"kind": "meme", "text": "описание реальной локальной шутки, сленга или правила участников (или пустой массив [])"}
   ],
   "member_updates": [
     {
@@ -301,7 +306,7 @@ MEMORY_EXTRACTION_SYSTEM_PROMPT = """Ты — аналитик социальн�
       "new_facts": [
         {
           "category": "work | hobby | bio | opinion | style | relationship | other",
-          "fact_text": "конкретный атомарный факт об участнике",
+          "fact_text": "конкретный долгосрочный реальный факт об участнике",
           "confidence": 0.9,
           "source_message_id": 12345
         }
@@ -474,16 +479,24 @@ async def analyze_group_memory_batch(
                 mem.bot_attitude = att
 
             existing_fact_texts = {f.fact_text.strip().lower() for f in mem.facts}
+            added_for_member = 0
             for nf in m_upd.get("new_facts") or []:
+                if added_for_member >= 3:
+                    break
                 if not isinstance(nf, dict):
                     continue
                 f_text = str(nf.get("fact_text") or "").strip()
                 if not f_text or f_text.lower() in existing_fact_texts or f_text.startswith("[LOCKED"):
                     continue
+                try:
+                    conf = float(nf.get("confidence") if nf.get("confidence") is not None else 0.8)
+                except (TypeError, ValueError):
+                    conf = 0.8
+                if conf < 0.75:
+                    continue
                 cat = str(nf.get("category") or "other").strip().lower()
                 if cat not in ("work", "hobby", "bio", "opinion", "style", "relationship", "other"):
                     cat = "other"
-                conf = float(nf.get("confidence") or 0.8)
                 src_msg = nf.get("source_message_id")
                 src_msg_int = int(src_msg) if isinstance(src_msg, (int, str)) and str(src_msg).isdigit() else None
 
@@ -492,13 +505,14 @@ async def analyze_group_memory_batch(
                     group_id=group_id,
                     category=cat,
                     fact_text=f_text,
-                    confidence=max(0.1, min(1.0, conf)),
+                    confidence=min(1.0, conf),
                     source_message_id=src_msg_int,
                     is_pinned=False,
                 )
                 session.add(new_fact)
                 existing_fact_texts.add(f_text.lower())
                 facts_added += 1
+                added_for_member += 1
 
         # 3. Создание новых векторных эпизодов (pgvector)
         happened_ts = batch_msgs[-1].created_at if batch_msgs else datetime.now(timezone.utc)

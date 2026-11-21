@@ -575,7 +575,83 @@ async def complete_text(
     return content, usage
 
 
-async def create_embedding(session: AsyncSession, text_input: str) -> Optional[list[float]]:
+async def _resolve_yandex_query_model(
+    base_url: str,
+    api_key: str,
+    base_emb_model: str,
+) -> Optional[str]:
+    """Подбирает парную query-модель Yandex AI Studio для векторного поиска (с проверкой каталога)."""
+    clean = (base_emb_model or "").strip()
+    if not clean or "query" in clean.lower():
+        return clean or None
+
+    m = re.match(r"^emb://([^/]+)/(.+)$", clean)
+    folder_id = m.group(1) if m else None
+    cat_folder, available = await _fetch_yandex_catalog(base_url, api_key)
+    folder_id = folder_id or cat_folder
+
+    candidates: list[str] = []
+    if "-doc" in clean:
+        candidates.append(clean.replace("-doc", "-query"))
+    if "search-doc" in clean:
+        candidates.append(clean.replace("search-doc", "search-query"))
+    if folder_id:
+        candidates.append(f"emb://{folder_id}/text-embeddings-v2-query/latest")
+        candidates.append(f"emb://{folder_id}/text-search-query/latest")
+
+    for cand in dict.fromkeys(candidates):
+        if cand in available:
+            return cand
+
+    if not available and candidates:
+        return candidates[0]
+
+    return clean
+
+
+async def _request_openai_embedding(
+    client: AsyncOpenAI,
+    model: str,
+    text_input: str,
+    target_dim: int,
+    is_yandex: bool,
+) -> list[float]:
+    if is_yandex:
+        # Yandex AI Studio требует encoding_format="float" и отвергает параметр dimensions с 400 Bad Request
+        resp = await client.embeddings.create(
+            model=model,
+            input=text_input,
+            encoding_format="float",
+        )
+        return list(resp.data[0].embedding)
+
+    try:
+        resp = await client.embeddings.create(
+            model=model,
+            input=text_input,
+            encoding_format="float",
+            dimensions=target_dim,
+        )
+    except Exception:
+        try:
+            resp = await client.embeddings.create(
+                model=model,
+                input=text_input,
+                encoding_format="float",
+            )
+        except Exception:
+            resp = await client.embeddings.create(
+                model=model,
+                input=text_input,
+            )
+    return list(resp.data[0].embedding)
+
+
+async def create_embedding(
+    session: AsyncSession,
+    text_input: str,
+    emb_type: Literal["doc", "query"] = "doc",
+) -> Optional[list[float]]:
     cfg = await get_runtime_llm_config(session)
     if not cfg.embedding_api_key or not text_input.strip():
         return None
@@ -614,38 +690,32 @@ async def create_embedding(session: AsyncSession, text_input: str) -> Optional[l
         logger.warning("Google Embedding generation failed (fallback to text search).")
         return None
 
-    if not cfg.embedding_model and not _is_yandex_provider(cfg.embedding_base_url):
+    is_yandex_emb = _is_yandex_provider(cfg.embedding_base_url)
+    if not cfg.embedding_model and not is_yandex_emb:
         return None
 
     client, emb_model = await _build_openai_client_and_model(
         cfg.embedding_base_url, cfg.embedding_api_key, cfg.embedding_model, kind="emb", timeout=30.0
     )
-    try:
-        # encoding_format="float" обязателен для Yandex AI Studio (иначе openai-sdk шлёт base64 и получает 400)
+
+    candidate_models = [emb_model]
+    if is_yandex_emb and emb_type == "query":
+        query_model = await _resolve_yandex_query_model(cfg.embedding_base_url, cfg.embedding_api_key, emb_model)
+        if query_model and query_model != emb_model:
+            candidate_models = [query_model, emb_model]
+
+    last_exc: Optional[Exception] = None
+    for cand_model in candidate_models:
         try:
-            resp = await client.embeddings.create(
-                model=emb_model,
-                input=cleaned,
-                encoding_format="float",
-                dimensions=target_dim,
-            )
-        except Exception:
-            try:
-                resp = await client.embeddings.create(
-                    model=emb_model,
-                    input=cleaned,
-                    encoding_format="float",
-                )
-            except Exception:
-                resp = await client.embeddings.create(
-                    model=emb_model,
-                    input=cleaned,
-                )
-        raw_vec = list(resp.data[0].embedding)
-        return _normalize_vector_dim(raw_vec, target_dim)
-    except Exception as exc:
-        logger.warning("Embedding generation failed (fallback to text search): %s", exc)
-        return None
+            raw_vec = await _request_openai_embedding(client, cand_model, cleaned, target_dim, is_yandex_emb)
+            return _normalize_vector_dim(raw_vec, target_dim)
+        except Exception as exc:
+            last_exc = exc
+            if cand_model != candidate_models[-1]:
+                logger.debug("Query embedding model %s failed (%s), falling back to %s", cand_model, exc, candidate_models[-1])
+
+    logger.warning("Embedding generation failed (fallback to text search): %s", last_exc)
+    return None
 
 
 async def test_llm_connectivity(session: AsyncSession) -> dict[str, Any]:
