@@ -2,6 +2,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,126 @@ from app.redis_client import get_redis, publish_group_event
 from app.services.llm_service import complete_json, create_embedding
 
 logger = logging.getLogger(__name__)
+
+RU_WEEKDAYS = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+RU_MONTHS_GEN = (
+    "",
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
+
+
+def get_group_zoneinfo(tz_name: Optional[str]) -> ZoneInfo:
+    """Возвращает ZoneInfo часового пояса группы с безопасным fallback на Europe/Moscow."""
+    try:
+        return ZoneInfo((tz_name or "Europe/Moscow").strip() or "Europe/Moscow")
+    except Exception:
+        return ZoneInfo("Europe/Moscow")
+
+
+def _to_group_local(dt: Optional[datetime], tz_name: Optional[str]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(get_group_zoneinfo(tz_name))
+
+
+def format_current_datetime_context(tz_name: Optional[str], now_utc: Optional[datetime] = None) -> str:
+    """Форматирует текущую дату, день недели, время суток и локальное время для промпта."""
+    local_now = _to_group_local(now_utc or datetime.now(timezone.utc), tz_name)
+    assert local_now is not None
+    hour = local_now.hour
+    if hour < 6:
+        part_of_day = "ночь"
+    elif hour < 12:
+        part_of_day = "утро"
+    elif hour < 18:
+        part_of_day = "день"
+    else:
+        part_of_day = "вечер"
+
+    wd = RU_WEEKDAYS[local_now.weekday()]
+    mon = RU_MONTHS_GEN[local_now.month]
+    tz_label = (tz_name or "Europe/Moscow").strip() or "Europe/Moscow"
+    return (
+        f"{wd}, {local_now.day} {mon} {local_now.year} г., {local_now.strftime('%H:%M')} "
+        f"({local_now.strftime('%Y-%m-%d')}, {part_of_day}, часовой пояс: {tz_label})"
+    )
+
+
+def format_message_local_ts(dt: Optional[datetime], tz_name: Optional[str]) -> str:
+    """Возвращает компактную локальную метку времени сообщения в виде ДД.ММ ЧЧ:ММ."""
+    local_dt = _to_group_local(dt, tz_name)
+    return local_dt.strftime("%d.%m %H:%M") if local_dt else ""
+
+
+def format_episode_temporal_label(
+    happened_at: Optional[datetime],
+    tz_name: Optional[str],
+    now_utc: Optional[datetime] = None,
+) -> str:
+    """Форматирует дату/время эпизода в часовом поясе группы с указанием дня недели и давности."""
+    local_ep = _to_group_local(happened_at, tz_name)
+    if local_ep is None:
+        return "дата не указана"
+
+    local_now = _to_group_local(now_utc or datetime.now(timezone.utc), tz_name)
+    assert local_now is not None
+    days_diff = (local_now.date() - local_ep.date()).days
+    if days_diff == 0:
+        rel = "сегодня"
+    elif days_diff == 1:
+        rel = "вчера"
+    elif days_diff == 2:
+        rel = "позавчера"
+    elif days_diff > 2:
+        rel = f"{days_diff} дн. назад"
+    else:
+        rel = ""
+
+    wd = RU_WEEKDAYS[local_ep.weekday()]
+    base = f"{local_ep.strftime('%d.%m.%Y')}, {wd}, {local_ep.strftime('%H:%M')}"
+    return f"{base} ({rel})" if rel else base
+
+
+def build_episode_embedding_text(
+    title: str,
+    summary: str,
+    happened_at: Optional[datetime] = None,
+    tz_name: Optional[str] = None,
+    participants: Optional[list[str]] = None,
+) -> str:
+    """Собирает текст эпизода с датой, днём недели, временем и участниками для векторного поиска."""
+    local_dt = _to_group_local(happened_at or datetime.now(timezone.utc), tz_name)
+    assert local_dt is not None
+    wd = RU_WEEKDAYS[local_dt.weekday()]
+    mon = RU_MONTHS_GEN[local_dt.month]
+
+    parts = [
+        f"[Дата события: {local_dt.strftime('%Y-%m-%d %H:%M')}, "
+        f"{local_dt.strftime('%d.%m.%Y')}, {local_dt.day} {mon} {local_dt.year}, {wd}]"
+    ]
+    clean_participants = [str(p).strip() for p in (participants or []) if str(p).strip()]
+    if clean_participants:
+        parts.append(f"Участники: {', '.join(clean_participants)}.")
+    clean_title = (title or "").strip()
+    clean_summary = (summary or "").strip()
+    if clean_title:
+        parts.append(f"{clean_title}.")
+    if clean_summary:
+        parts.append(clean_summary)
+    return " ".join(parts)
 
 
 async def ensure_group_initialized(
@@ -224,10 +345,13 @@ async def build_persona_generation_context(
             lines.append("  Известные факты:\n    " + "\n    ".join(fact_strs))
         member_blocks.append("\n".join(lines))
 
+    tz_name = group.settings.timezone if group.settings else "Europe/Moscow"
+    now_str = format_current_datetime_context(tz_name)
+
     episode_lines = []
     used_episodes_meta = []
     for ep, sim in episodes_with_sim:
-        date_str = ep.happened_at.strftime("%Y-%m-%d")
+        date_str = format_episode_temporal_label(ep.happened_at, tz_name)
         episode_lines.append(f"- [{date_str}] {ep.title}: {ep.episode_summary}")
         used_episodes_meta.append({"id": str(ep.id), "title": ep.title, "similarity": sim})
 
@@ -235,6 +359,9 @@ async def build_persona_generation_context(
 
     system_prompt = f"""Ты — живой участник группового чата «{group.title}» в Telegram.
 Твоё имя/ник в общении: {persona['display_name']}.
+
+ТЕКУЩАЯ ДАТА И МЕСТНОЕ ВРЕМЯ В ЧАТЕ:
+{now_str}
 
 ТВОЯ ЛИЧНОСТЬ И ЛЕГЕНДА:
 {persona['backstory']}
@@ -267,6 +394,7 @@ async def build_persona_generation_context(
 
     meta = {
         "persona_name": persona["display_name"],
+        "current_local_time": now_str,
         "memory_query": memory_query,
         "members_loaded": [m.display_name for m in members],
         "facts_used": used_facts_meta[:15],
@@ -395,12 +523,14 @@ async def analyze_group_memory_batch(
                 }
             )
 
+        tz_name = group.settings.timezone if group.settings else "Europe/Moscow"
         transcript_lines = []
         for m in batch_msgs:
             role_tag = "[БОТ]" if m.is_from_bot else f"[member_id={m.member_id}]"
             reply_part = f" (reply to #{m.reply_to_tg_msg_id})" if m.reply_to_tg_msg_id else ""
             react_part = f" [реакции: {m.reactions}]" if m.reactions else ""
-            ts = m.created_at.strftime("%Y-%m-%d %H:%M")
+            local_dt = _to_group_local(m.created_at, tz_name)
+            ts = local_dt.strftime("%Y-%m-%d %H:%M") if local_dt else ""
             transcript_lines.append(
                 f"#{m.telegram_message_id} [{ts}] {m.sender_name} {role_tag}{reply_part}: {m.text_content}{react_part}"
             )
@@ -524,7 +654,14 @@ async def analyze_group_memory_batch(
             if not summary:
                 continue
             participants = [str(p).strip() for p in (ep_data.get("participant_names") or []) if str(p).strip()]
-            emb = await create_embedding(session, f"{title}. {summary}")
+            emb_text = build_episode_embedding_text(
+                title=title,
+                summary=summary,
+                happened_at=happened_ts,
+                tz_name=tz_name,
+                participants=participants,
+            )
+            emb = await create_embedding(session, emb_text, emb_type="doc")
             session.add(
                 MemoryEpisode(
                     group_id=group_id,

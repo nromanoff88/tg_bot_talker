@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -29,6 +30,7 @@ from app.services.decision_service import generate_poll_via_llm, sanitize_poll_p
 from app.services.import_service import import_telegram_desktop_files
 from app.services.llm_service import create_embedding
 from app.services.memory_service import (
+    build_episode_embedding_text,
     ensure_group_initialized,
     resolve_effective_persona,
     search_relevant_episodes,
@@ -243,15 +245,27 @@ async def create_episode_manually(
     payload: MemoryEpisodeCreate,
     session: AsyncSession = Depends(get_db),
 ) -> MemoryEpisodeOut:
-    await ensure_group_initialized(session, group_id)
-    emb = await create_embedding(session, f"{payload.title}. {payload.episode_summary}")
+    group = await ensure_group_initialized(session, group_id)
+    tz_name = group.settings.timezone if group.settings else None
+    now_dt = datetime.now(timezone.utc)
+    title = payload.title.strip()
+    summary = payload.episode_summary.strip()
+    emb_text = build_episode_embedding_text(
+        title=title,
+        summary=summary,
+        happened_at=now_dt,
+        tz_name=tz_name,
+        participants=payload.participant_names,
+    )
+    emb = await create_embedding(session, emb_text, emb_type="doc")
     ep = MemoryEpisode(
         group_id=group_id,
-        title=payload.title.strip(),
-        episode_summary=payload.episode_summary.strip(),
+        title=title,
+        episode_summary=summary,
         embedding=emb,
         participant_names=payload.participant_names,
         is_locked=payload.is_locked,
+        happened_at=now_dt,
     )
     session.add(ep)
     await session.commit()
@@ -295,7 +309,16 @@ async def update_episode(
         ep.is_locked = True
 
     if reembed:
-        ep.embedding = await create_embedding(session, f"{ep.title}. {ep.episode_summary}")
+        group = await ensure_group_initialized(session, group_id)
+        tz_name = group.settings.timezone if group.settings else None
+        emb_text = build_episode_embedding_text(
+            title=ep.title,
+            summary=ep.episode_summary,
+            happened_at=ep.happened_at,
+            tz_name=tz_name,
+            participants=ep.participant_names or [],
+        )
+        ep.embedding = await create_embedding(session, emb_text, emb_type="doc")
 
     await session.commit()
     await session.refresh(ep)

@@ -15,6 +15,8 @@ from app.services.llm_service import LLMUsage, complete_json, complete_text
 from app.services.memory_service import (
     build_persona_generation_context,
     ensure_group_initialized,
+    format_current_datetime_context,
+    format_message_local_ts,
     resolve_effective_persona,
 )
 
@@ -174,10 +176,12 @@ async def generate_poll_via_llm(
         memory_query=topic_hint or (recent_msgs[-1].text_content[:200] if recent_msgs else ""),
     )
 
+    tz_name = group.settings.timezone if group.settings else None
     chat_lines = []
     for m in recent_msgs[-20:]:
         who = f"{persona['display_name']} (ТЫ)" if m.is_from_bot else m.sender_name
-        chat_lines.append(f"#{m.telegram_message_id} {who}: {m.text_content}")
+        ts = format_message_local_ts(m.created_at, tz_name)
+        chat_lines.append(f"#{m.telegram_message_id} [{ts}] {who}: {m.text_content}")
 
     hints_lines = []
     if topic_hint:
@@ -238,6 +242,7 @@ ROUTER_SYSTEM_PROMPT = """Ты — внутренний фильтр социа�
 
 Учитывай параметр `chattiness_level` (от 0.0 — почти всегда молчит, до 1.0 — очень разговорчивый душа компании).
 Если `is_direct_ping = true` (тебя упомянули или ответили на твоё сообщение), почти всегда выбирай "reply" (или "poll", если прямо просят создать опрос/голосование/викторину).
+Если в чате спрашивают о прошлых событиях по времени или дню («вчера», «в пятницу», «на прошлой неделе»), установи `need_memory_search = true` и подставь в `memory_query` конкретную дату и день недели, опираясь на текущую дату.
 
 Верни СТРОГО JSON:
 {
@@ -388,15 +393,18 @@ async def evaluate_group_batch_and_decide(
                 + (f" (отношение: {mr.bot_attitude[:80]})" if mr.bot_attitude else "")
             )
 
+    now_str = format_current_datetime_context(g_settings.timezone, now_utc)
     chat_lines = []
     for m in recent_msgs[-22:]:
         who = f"{persona['display_name']} [ТЫ]" if m.is_from_bot else m.sender_name
         r_tag = f" (reply->#{m.reply_to_tg_msg_id})" if m.reply_to_tg_msg_id else ""
         new_tag = " [НОВОЕ]" if m.telegram_message_id in trigger_set else ""
-        chat_lines.append(f"#{m.telegram_message_id}{new_tag} {who}{r_tag}: {m.text_content}")
+        ts = format_message_local_ts(m.created_at, g_settings.timezone)
+        chat_lines.append(f"#{m.telegram_message_id}{new_tag} [{ts}] {who}{r_tag}: {m.text_content}")
 
     router_user_prompt = (
         f"ГРУППА: {group.title}\n"
+        f"ТЕКУЩЕЕ МЕСТНОЕ ВРЕМЯ ГРУППЫ: {now_str}\n"
         f"ТВОЯ РОЛЬ: {persona['display_name']} — {persona['backstory'][:280]}\n"
         f"ПАРАМЕТРЫ ПОВЕДЕНИЯ:\n"
         f"- chattiness_level: {effective_chattiness}\n"
@@ -521,7 +529,8 @@ async def evaluate_group_batch_and_decide(
     for m in recent_msgs:
         who = f"{persona['display_name']} (ТЫ)" if m.is_from_bot else m.sender_name
         r_tag = f" [ответ на #{m.reply_to_tg_msg_id}]" if m.reply_to_tg_msg_id else ""
-        full_chat_lines.append(f"#{m.telegram_message_id} {who}{r_tag}: {m.text_content}")
+        ts = format_message_local_ts(m.created_at, g_settings.timezone)
+        full_chat_lines.append(f"#{m.telegram_message_id} [{ts}] {who}{r_tag}: {m.text_content}")
 
     reply_instruction = (
         f"Напиши естественный живой ответ реплаем на сообщение #{target_msg_id}."

@@ -14,6 +14,8 @@ from app.services.llm_service import complete_text
 from app.services.memory_service import (
     build_persona_generation_context,
     ensure_group_initialized,
+    format_current_datetime_context,
+    format_message_local_ts,
     resolve_effective_persona,
 )
 
@@ -71,13 +73,15 @@ async def generate_and_send_proactive_message(
             nick = f" (в чате: {m.chat_nickname})" if m.chat_nickname else ""
             member_hooks.append(f"- {m.display_name}{nick}{uname}: {m.character_summary} | Факты: {facts_preview}")
 
+    now_str = format_current_datetime_context(g_settings.timezone, now_utc)
     recent_preview = "\n".join(
-        f"[{m.created_at.strftime('%Y-%m-%d %H:%M')}] {m.sender_name}: {m.text_content[:140]}"
+        f"[{format_message_local_ts(m.created_at, g_settings.timezone)}] {m.sender_name}: {m.text_content[:140]}"
         for m in recent_msgs[-8:]
     )
 
     if start_new_topic:
         user_prompt = (
+            f"ТЕКУЩЕЕ МЕСТНОЕ ВРЕМЯ: {now_str}\n"
             f"В чате «{group.title}» тишина уже более {silence_hours:.1f} ч. "
             f"Предыдущий разговор давно закончился, и ты решил сам закинуть в чат НОВУЮ тему.\n\n"
             f"О ЧЁМ ГОВОРИЛИ В ПРОШЛЫЙ РАЗ (ТОЛЬКО ДЛЯ СПРАВКИ, ЧТОБЫ НЕ ПОВТОРЯТЬСЯ):\n"
@@ -92,6 +96,7 @@ async def generate_and_send_proactive_message(
         )
     else:
         user_prompt = (
+            f"ТЕКУЩЕЕ МЕСТНОЕ ВРЕМЯ: {now_str}\n"
             f"В чате «{group.title}» небольшая пауза ({silence_hours * 60:.0f} мин). "
             f"Ты решил сам непринуждённо написать в чат и поддержать или оживить разговор.\n\n"
             f"ЧТО НЕДАВНО ПИСАЛИ В ЧАТЕ:\n{recent_preview or 'Чат пока почти пуст.'}\n\n"
