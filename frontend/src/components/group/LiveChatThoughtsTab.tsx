@@ -430,6 +430,15 @@ export function LiveChatThoughtsTab({ group, onRefreshGroup }: Props) {
                 };
                 const factsUsed = d.retrieved_context_meta?.facts_used || [];
                 const episodesUsed = d.retrieved_context_meta?.episodes_used || [];
+                const llmPrompts = d.retrieved_context_meta?.llm_prompts;
+                const promptSections = [
+                  { label: 'Smart LLM — System Prompt', text: llmPrompts?.smart_system_prompt },
+                  { label: 'Smart LLM — User Prompt', text: llmPrompts?.smart_user_prompt },
+                  { label: 'Fast LLM (Роутер) — System Prompt', text: llmPrompts?.router_system_prompt },
+                  { label: 'Fast LLM (Роутер) — User Prompt', text: llmPrompts?.router_user_prompt },
+                  { label: 'Memory Worker (Fast LLM) — System Prompt', text: llmPrompts?.fast_system_prompt },
+                  { label: 'Memory Worker (Fast LLM) — User Prompt', text: llmPrompts?.fast_user_prompt },
+                ].filter((s): s is { label: string; text: string } => typeof s.text === 'string' && s.text.length > 0);
                 const pollPayload = d.action_payload?.poll;
 
                 return (
@@ -492,6 +501,26 @@ export function LiveChatThoughtsTab({ group, onRefreshGroup }: Props) {
                             <div key={i}>
                               • {f.member}: {f.fact}
                             </div>
+                          ))}
+                        </div>
+                      </details>
+                    )}
+
+                    {promptSections.length > 0 && (
+                      <details className="text-[11px] text-slate-400">
+                        <summary className="cursor-pointer hover:text-indigo-300 text-indigo-400/90 font-medium">
+                          Показать полный промпт, отправленный в LLM
+                        </summary>
+                        <div className="mt-2 space-y-2.5 pl-2 border-l border-indigo-500/30">
+                          {promptSections.map((sec) => (
+                            <details key={sec.label} open={sec.label.startsWith('Smart LLM')}>
+                              <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-slate-400 hover:text-slate-200">
+                                {sec.label} ({sec.text.length} симв.)
+                              </summary>
+                              <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed bg-slate-900 border border-slate-800 rounded-lg p-2.5 max-h-64 overflow-y-auto text-slate-300">
+                                {sec.text}
+                              </pre>
+                            </details>
                           ))}
                         </div>
                       </details>

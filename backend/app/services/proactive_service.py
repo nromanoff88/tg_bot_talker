@@ -131,6 +131,10 @@ async def generate_and_send_proactive_message(
         if manual_trigger
         else f"Спонтанная инициатива бота в период затишья: {mode_label}."
     )
+    context_meta["llm_prompts"] = {
+        "smart_system_prompt": sys_prompt,
+        "smart_user_prompt": user_prompt,
+    }
     log_entry = DecisionLog(
         group_id=group_id,
         trigger_tg_msg_ids=[],

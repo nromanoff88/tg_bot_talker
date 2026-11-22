@@ -701,7 +701,13 @@ async def analyze_group_memory_batch(
                 f"добавлено фактов: {facts_added}, эпизодов памяти: {episodes_added}."
             ),
             action_payload={"processed_messages": len(batch_msgs), "facts_added": facts_added, "episodes_added": episodes_added},
-            retrieved_context_meta={"remaining_unanalyzed": int(remaining)},
+            retrieved_context_meta={
+                "remaining_unanalyzed": int(remaining),
+                "llm_prompts": {
+                    "fast_system_prompt": MEMORY_EXTRACTION_SYSTEM_PROMPT,
+                    "fast_user_prompt": user_prompt,
+                },
+            },
             model_used=usage.model,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,

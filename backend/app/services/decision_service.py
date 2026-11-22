@@ -229,6 +229,10 @@ async def generate_poll_via_llm(
         raw_poll["allows_multiple_answers"] = preferred_multiple
 
     sanitized = sanitize_poll_params(raw_poll)
+    context_meta["llm_prompts"] = {
+        "smart_system_prompt": sys_prompt,
+        "smart_user_prompt": user_prompt,
+    }
     return sanitized, context_meta, usage
 
 
@@ -441,6 +445,11 @@ async def evaluate_group_batch_and_decide(
         raw_action = "ignore"
         reasoning += " (Реакции отключены в настройках группы)."
 
+    router_prompts = {
+        "router_system_prompt": ROUTER_SYSTEM_PROMPT,
+        "router_user_prompt": router_user_prompt,
+    }
+
     # Ветка 1: Промолчать
     if raw_action == "ignore":
         await _save_decision_log(
@@ -450,7 +459,7 @@ async def evaluate_group_batch_and_decide(
             "ignore",
             reasoning,
             {},
-            {"is_direct_ping": is_direct_ping, "chattiness": effective_chattiness},
+            {"is_direct_ping": is_direct_ping, "chattiness": effective_chattiness, "llm_prompts": router_prompts},
             router_usage,
         )
         return BotDecisionResult(action="ignore", reasoning=reasoning)
@@ -469,7 +478,7 @@ async def evaluate_group_batch_and_decide(
             "react",
             reasoning,
             {"emoji": chosen_emoji, "target_tg_msg_id": target_msg_id},
-            {"is_direct_ping": is_direct_ping},
+            {"is_direct_ping": is_direct_ping, "llm_prompts": router_prompts},
             router_usage,
         )
         return BotDecisionResult(
@@ -489,6 +498,10 @@ async def evaluate_group_batch_and_decide(
         )
         poll_ctx_meta["is_direct_ping"] = is_direct_ping
         poll_ctx_meta["router_action"] = "poll"
+        poll_ctx_meta["llm_prompts"] = {
+            **router_prompts,
+            **(poll_ctx_meta.get("llm_prompts") or {}),
+        }
         total_usage = router_usage + poll_usage
         reply_id = target_msg_id if is_direct_ping else None
 
@@ -544,6 +557,11 @@ async def evaluate_group_batch_and_decide(
         + f"\n\nТВОЯ ВНУТРЕННЯЯ МОТИВАЦИЯ СЕЙЧАС: {reasoning}\n"
         + f"ЗАДАЧА: {reply_instruction}"
     )
+    context_meta["llm_prompts"] = {
+        **router_prompts,
+        "smart_system_prompt": sys_prompt,
+        "smart_user_prompt": gen_user_prompt,
+    }
 
     reply_text, smart_usage = await complete_text(
         session=session,
