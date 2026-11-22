@@ -441,7 +441,7 @@ async def analyze_group_memory_batch(
     session: AsyncSession,
     group_id: int,
     force: bool = False,
-    batch_limit: int = 60,
+    batch_limit: int = 35,
 ) -> dict[str, Any]:
     """
     Анализирует непрочитанный буфер сообщений группы и обновляет гибридную память,
@@ -602,7 +602,7 @@ async def analyze_group_memory_batch(
             existing_fact_texts = {f.fact_text.strip().lower() for f in mem.facts}
             added_for_member = 0
             for nf in m_upd.get("new_facts") or []:
-                if added_for_member >= 3:
+                if added_for_member >= 5:
                     break
                 if not isinstance(nf, dict):
                     continue
@@ -613,13 +613,14 @@ async def analyze_group_memory_batch(
                     conf = float(nf.get("confidence") if nf.get("confidence") is not None else 0.8)
                 except (TypeError, ValueError):
                     conf = 0.8
-                if conf < 0.75:
+                if conf < 0.7:
                     continue
                 cat = str(nf.get("category") or "other").strip().lower()
                 if cat not in ("work", "hobby", "bio", "opinion", "style", "relationship", "other"):
                     cat = "other"
                 src_msg = nf.get("source_message_id")
-                src_msg_int = int(src_msg) if isinstance(src_msg, (int, str)) and str(src_msg).isdigit() else None
+                src_clean = str(src_msg).lstrip("#").strip() if isinstance(src_msg, (int, str)) else ""
+                src_msg_int = int(src_clean) if src_clean.isdigit() else None
 
                 new_fact = MemberFact(
                     member_id=mem.id,
@@ -636,8 +637,9 @@ async def analyze_group_memory_batch(
                 added_for_member += 1
 
         # 3. Создание новых векторных эпизодов (pgvector)
-        happened_ts = batch_msgs[-1].created_at if batch_msgs else datetime.now(timezone.utc)
-        for ep_data in (extracted.get("new_episodes") or [])[:2]:
+        msgs_by_tg_id = {m.telegram_message_id: m for m in batch_msgs}
+        default_happened_ts = batch_msgs[-1].created_at if batch_msgs else datetime.now(timezone.utc)
+        for ep_data in (extracted.get("new_episodes") or [])[:3]:
             if not isinstance(ep_data, dict):
                 continue
             title = str(ep_data.get("title") or "").strip()[:255]
@@ -645,10 +647,20 @@ async def analyze_group_memory_batch(
             if not summary:
                 continue
             participants = [str(p).strip() for p in (ep_data.get("participant_names") or []) if str(p).strip()]
+
+            ep_happened_ts = default_happened_ts
+            src_ep_id = ep_data.get("source_message_id")
+            if isinstance(src_ep_id, (int, str)):
+                src_ep_clean = str(src_ep_id).lstrip("#").strip()
+                if src_ep_clean.lstrip("-").isdigit():
+                    src_msg_obj = msgs_by_tg_id.get(int(src_ep_clean))
+                    if src_msg_obj and src_msg_obj.created_at:
+                        ep_happened_ts = src_msg_obj.created_at
+
             emb_text = build_episode_embedding_text(
                 title=title,
                 summary=summary,
-                happened_at=happened_ts,
+                happened_at=ep_happened_ts,
                 tz_name=tz_name,
                 participants=participants,
             )
@@ -661,7 +673,7 @@ async def analyze_group_memory_batch(
                     embedding=emb,
                     participant_names=participants,
                     is_locked=False,
-                    happened_at=happened_ts,
+                    happened_at=ep_happened_ts,
                 )
             )
             episodes_added += 1

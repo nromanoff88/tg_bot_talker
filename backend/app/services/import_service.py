@@ -114,10 +114,30 @@ def _extract_reactions_dict(msg_obj: dict[str, Any]) -> dict[str, int]:
     return reactions_out
 
 
+VOID_HTML_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+
+
 class _TelegramHTMLParser(HTMLParser):
     """Парсер стандартного HTML-экспорта истории чата из Telegram Desktop (messages.html)."""
 
-    def __init__(self) -> None:
+    def __init__(self, initial_last_sender: str = "Участник") -> None:
         super().__init__(convert_charrefs=True)
         self.chat_title: str = ""
         self.messages: list[dict[str, Any]] = []
@@ -127,7 +147,7 @@ class _TelegramHTMLParser(HTMLParser):
 
         self._cur_msg: Optional[dict[str, Any]] = None
         self._cur_msg_depth: int = 0
-        self._last_sender_name: str = "Участник"
+        self._last_sender_name: str = initial_last_sender or "Участник"
 
         self._cur_reaction_emoji: list[str] = []
         self._cur_reaction_count: list[str] = []
@@ -140,11 +160,63 @@ class _TelegramHTMLParser(HTMLParser):
                 return True
         return False
 
+    def _finalize_current_message(self) -> None:
+        if self._cur_msg is None:
+            return
+        msg = self._cur_msg
+        self._cur_msg = None
+        self._cur_msg_depth = 0
+        self._in_reaction_depth = 0
+
+        sender = html.unescape("".join(msg["_from_parts"])).strip()
+        if sender:
+            self._last_sender_name = sender
+        elif msg["is_joined"]:
+            sender = self._last_sender_name
+        else:
+            sender = "Участник"
+
+        main_text = html.unescape("".join(msg["_text_parts"])).strip()
+        fwd_text = html.unescape("".join(msg["_fwd_parts"])).strip()
+        if not main_text and fwd_text:
+            main_text = f"[Переслано] {fwd_text}"
+
+        if not main_text:
+            return
+
+        self.messages.append(
+            {
+                "type": "message",
+                "id": msg["id"],
+                "from": sender,
+                "from_id": make_synthetic_user_id(sender),
+                "date": msg["date"],
+                "reply_to_message_id": msg["reply_to_message_id"],
+                "text": main_text,
+                "reactions": msg["reactions"],
+            }
+        )
+
+    def close(self) -> None:
+        super().close()
+        self._finalize_current_message()
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        tag_low = tag.lower()
         attr_dict = dict(attrs)
         classes = set((attr_dict.get("class") or "").split())
-        self._stack.append((tag, classes, attr_dict))
-        depth = len(self._stack)
+
+        # Пустые HTML-теги (<br>, <img>, <hr>, <meta>...) не имеют закрывающего тега и не должны попадать в стек
+        if tag_low in VOID_HTML_TAGS:
+            if self._cur_msg is not None:
+                if tag_low == "br" and self._has_class_in_stack("text", self._cur_msg_depth):
+                    if self._has_class_in_stack("forwarded", self._cur_msg_depth):
+                        self._cur_msg["_fwd_parts"].append("\n")
+                    else:
+                        self._cur_msg["_text_parts"].append("\n")
+                if self._in_reaction_depth > 0 and "userpic" in classes:
+                    self._cur_reaction_userpics += 1
+            return
 
         # Заголовок чата в шапке экспорта
         if "text" in classes and "bold" in classes and self._has_class_in_stack("page_header"):
@@ -153,15 +225,18 @@ class _TelegramHTMLParser(HTMLParser):
 
         # Начало карточки сообщения: <div class="message default clearfix ..." id="message12345">
         if (
-            self._cur_msg is None
-            and tag == "div"
+            tag_low == "div"
             and "message" in classes
             and "default" in classes
             and "service" not in classes
+            and not (self._cur_msg is not None and self._has_class_in_stack("forwarded", self._cur_msg_depth))
         ):
             raw_id = attr_dict.get("id") or ""
             m_id = re.match(r"^message(-?\d+)$", raw_id)
             if m_id and int(m_id.group(1)) > 0:
+                if self._cur_msg is not None:
+                    self._finalize_current_message()
+                self._stack.append((tag_low, classes, attr_dict))
                 self._cur_msg = {
                     "id": int(m_id.group(1)),
                     "is_joined": "joined" in classes,
@@ -173,8 +248,11 @@ class _TelegramHTMLParser(HTMLParser):
                     "_fwd_parts": [],
                     "reactions": {},
                 }
-                self._cur_msg_depth = depth
+                self._cur_msg_depth = len(self._stack)
                 return
+
+        self._stack.append((tag_low, classes, attr_dict))
+        depth = len(self._stack)
 
         if self._cur_msg is None:
             return
@@ -188,19 +266,12 @@ class _TelegramHTMLParser(HTMLParser):
                 self._cur_msg["date"] = title_val
 
         # Ссылка на сообщение, на которое отвечают (reply_to)
-        if tag == "a" and not in_forwarded and self._has_class_in_stack("reply_to", self._cur_msg_depth):
+        if tag_low == "a" and not in_forwarded and self._has_class_in_stack("reply_to", self._cur_msg_depth):
             href = attr_dict.get("href") or ""
             onclick = attr_dict.get("onclick") or ""
             m_rep = re.search(r"go_to_message(\d+)", href) or re.search(r"GoToMessage\((\d+)\)", onclick)
             if m_rep:
                 self._cur_msg["reply_to_message_id"] = int(m_rep.group(1))
-
-        # Перенос строки внутри текста
-        if tag == "br" and self._has_class_in_stack("text", self._cur_msg_depth):
-            if in_forwarded:
-                self._cur_msg["_fwd_parts"].append("\n")
-            else:
-                self._cur_msg["_text_parts"].append("\n")
 
         # Реакция на сообщении
         if "reaction" in classes and "reactions" not in classes and self._in_reaction_depth == 0:
@@ -245,78 +316,61 @@ class _TelegramHTMLParser(HTMLParser):
                 self._cur_msg["_text_parts"].append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if not self._stack:
+        tag_low = tag.lower()
+        if tag_low in VOID_HTML_TAGS or not self._stack:
             return
 
-        depth = len(self._stack)
-        _, classes, _ = self._stack.pop()
-
-        if self._in_page_header_text and "text" in classes and "bold" in classes:
-            self._in_page_header_text = False
-            self.chat_title = self.chat_title.strip()
-
-        if self._cur_msg is None:
+        # Ищем ближайший открытый тег с тем же именем (защита от незакрытых тегов в разметке)
+        match_idx: Optional[int] = None
+        for idx in range(len(self._stack) - 1, -1, -1):
+            if self._stack[idx][0] == tag_low:
+                match_idx = idx
+                break
+        if match_idx is None:
             return
 
-        # Закрытие одной реакции
-        if self._in_reaction_depth > 0 and depth == self._in_reaction_depth:
-            emoji_str = "".join(self._cur_reaction_emoji).strip()
-            count_str = "".join(self._cur_reaction_count).strip()
-            if emoji_str:
-                cnt = int(count_str) if count_str.isdigit() else max(1, self._cur_reaction_userpics)
-                self._cur_msg["reactions"][emoji_str] = cnt
-            self._in_reaction_depth = 0
+        while len(self._stack) > match_idx:
+            depth = len(self._stack)
+            _, classes, _ = self._stack.pop()
 
-        # Закрытие карточки сообщения
-        if depth == self._cur_msg_depth:
-            msg = self._cur_msg
-            self._cur_msg = None
-            self._cur_msg_depth = 0
+            if self._in_page_header_text and "text" in classes and "bold" in classes:
+                self._in_page_header_text = False
+                self.chat_title = self.chat_title.strip()
 
-            sender = html.unescape("".join(msg["_from_parts"])).strip()
-            if sender:
-                self._last_sender_name = sender
-            elif msg["is_joined"]:
-                sender = self._last_sender_name
-            else:
-                sender = "Участник"
+            if self._cur_msg is None:
+                continue
 
-            main_text = html.unescape("".join(msg["_text_parts"])).strip()
-            fwd_text = html.unescape("".join(msg["_fwd_parts"])).strip()
-            if not main_text and fwd_text:
-                main_text = f"[Переслано] {fwd_text}"
+            # Закрытие одной реакции
+            if self._in_reaction_depth > 0 and depth == self._in_reaction_depth:
+                emoji_str = "".join(self._cur_reaction_emoji).strip()
+                count_str = "".join(self._cur_reaction_count).strip()
+                if emoji_str:
+                    cnt = int(count_str) if count_str.isdigit() else max(1, self._cur_reaction_userpics)
+                    self._cur_msg["reactions"][emoji_str] = cnt
+                self._in_reaction_depth = 0
 
-            if not main_text:
-                return
-
-            self.messages.append(
-                {
-                    "type": "message",
-                    "id": msg["id"],
-                    "from": sender,
-                    "from_id": make_synthetic_user_id(sender),
-                    "date": msg["date"],
-                    "reply_to_message_id": msg["reply_to_message_id"],
-                    "text": main_text,
-                    "reactions": msg["reactions"],
-                }
-            )
+            # Закрытие карточки сообщения
+            if depth == self._cur_msg_depth:
+                self._finalize_current_message()
 
 
-def _parse_export_file_bytes(raw_bytes: bytes) -> tuple[str, list[dict[str, Any]]]:
-    """Автоматически определяет формат файла (JSON или HTML из Telegram Desktop) и возвращает (title, messages)."""
+def _parse_export_file_bytes(
+    raw_bytes: bytes,
+    initial_last_sender: str = "Участник",
+) -> tuple[str, list[dict[str, Any]], str]:
+    """Автоматически определяет формат файла (JSON или HTML из Telegram Desktop) и возвращает (title, messages, last_sender)."""
     text = raw_bytes.decode("utf-8-sig", errors="replace").lstrip()
     if not text:
         raise ValueError("Загруженный файл пуст.")
 
     # 1. Если файл начинается с '<' или содержит HTML-разметку Telegram Desktop
     if text.startswith("<") or "<div class=\"message" in text[:4000]:
-        parser = _TelegramHTMLParser()
+        parser = _TelegramHTMLParser(initial_last_sender=initial_last_sender)
         parser.feed(text)
         parser.close()
         if not parser.messages and "page_header" not in text and "history" not in text:
             raise ValueError("В HTML-файле не найдено сообщений формата экспорта Telegram Desktop.")
-        return parser.chat_title, parser.messages
+        return parser.chat_title, parser.messages, parser._last_sender_name
 
     # 2. Иначе парсим как JSON (result.json)
     try:
@@ -329,7 +383,7 @@ def _parse_export_file_bytes(raw_bytes: bytes) -> tuple[str, list[dict[str, Any]
     if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
         raise ValueError("Некорректный структура JSON: ожидается экспорт чата Telegram Desktop с полем 'messages'.")
 
-    return str(payload.get("name") or "").strip(), payload["messages"]
+    return str(payload.get("name") or "").strip(), payload["messages"], initial_last_sender
 
 
 async def import_telegram_desktop_files(
@@ -344,9 +398,10 @@ async def import_telegram_desktop_files(
     """
     all_raw_messages: list[dict[str, Any]] = []
     export_title = ""
+    last_sender = "Участник"
 
     for raw_bytes in files_bytes:
-        title, msgs = _parse_export_file_bytes(raw_bytes)
+        title, msgs, last_sender = _parse_export_file_bytes(raw_bytes, initial_last_sender=last_sender)
         if title and not export_title:
             export_title = title
         all_raw_messages.extend(msgs)
@@ -360,10 +415,10 @@ async def import_telegram_desktop_files(
     bot_display = (sys_cfg.bot_display_name or "").strip().lower() if sys_cfg else ""
     bot_uname = (sys_cfg.bot_username or "").strip().lower() if sys_cfg else ""
 
-    existing_ids_rows = (
-        await session.execute(select(Message.telegram_message_id).where(Message.group_id == group_id))
+    existing_msgs_rows = (
+        await session.execute(select(Message).where(Message.group_id == group_id))
     ).scalars().all()
-    existing_msg_ids = set(existing_ids_rows)
+    existing_msgs_by_tg_id: dict[int, Message] = {m.telegram_message_id: m for m in existing_msgs_rows}
 
     existing_members_rows = (
         await session.execute(select(GroupMember).where(GroupMember.group_id == group_id))
@@ -375,6 +430,7 @@ async def import_telegram_desktop_files(
 
     discovered_members = 0
     imported_count = 0
+    repaired_count = 0
     skipped_duplicates = 0
     new_messages_buffer: list[Message] = []
 
@@ -386,12 +442,31 @@ async def import_telegram_desktop_files(
         if not isinstance(tg_msg_id, int):
             continue
 
-        if tg_msg_id in existing_msg_ids:
-            skipped_duplicates += 1
-            continue
-
         text_content = _flatten_tg_text(raw_msg.get("text"))
         if not text_content:
+            continue
+
+        existing_msg = existing_msgs_by_tg_id.get(tg_msg_id)
+        if existing_msg is not None:
+            # Если ранее импортированное сообщение попало в БД искажённым/обрезанным из-за старого парсера — чиним текст и переанализируем
+            updated = False
+            if existing_msg.is_imported and text_content != (existing_msg.text_content or ""):
+                existing_msg.text_content = text_content
+                updated = True
+            new_sender = str(raw_msg.get("from") or "").strip()[:255]
+            if (
+                existing_msg.is_imported
+                and new_sender
+                and new_sender != "Участник"
+                and existing_msg.sender_name in ("Участник", "", None)
+            ):
+                existing_msg.sender_name = new_sender
+                updated = True
+            if updated:
+                existing_msg.is_processed_for_memory = False
+                repaired_count += 1
+            else:
+                skipped_duplicates += 1
             continue
 
         user_tg_id = _parse_from_user_id(raw_msg.get("from_id"))
@@ -448,7 +523,7 @@ async def import_telegram_desktop_files(
             created_at=msg_dt,
         )
         new_messages_buffer.append(msg_entity)
-        existing_msg_ids.add(tg_msg_id)
+        existing_msgs_by_tg_id[tg_msg_id] = msg_entity
         imported_count += 1
 
         if not group.last_message_at or msg_dt > group.last_message_at:
@@ -474,16 +549,17 @@ async def import_telegram_desktop_files(
     await session.commit()
 
     queued_batches = 0
-    if trigger_analysis and imported_count > 0:
-        queued_batches = max(1, (imported_count + 59) // 60)
+    total_changed = imported_count + repaired_count
+    if trigger_analysis and total_changed > 0:
+        queued_batches = max(1, (total_changed + 34) // 35)
         try:
             arq = await get_arq_pool()
-            await arq.enqueue_job("process_all_pending_memory_job", group_id, max_batches=30)
+            await arq.enqueue_job("process_all_pending_memory_job", group_id, max_batches=25)
         except Exception as exc:
             logger.warning("Failed to enqueue ARQ memory job after import: %s", exc)
 
     return {
-        "imported_messages": imported_count,
+        "imported_messages": total_changed,
         "skipped_duplicates": skipped_duplicates,
         "discovered_members": discovered_members,
         "queued_analysis_batches": queued_batches,
