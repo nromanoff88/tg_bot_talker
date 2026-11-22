@@ -237,6 +237,15 @@ async def generate_poll_via_llm(
     return sanitized, context_meta, usage
 
 
+def _build_persona_name_pattern(name: str) -> str:
+    """Строит regex для имени Персоны с учётом русских падежей и окончаний."""
+    clean = name.strip().lower()
+    if len(clean) >= 4 and clean[-1] in "аяоеиыуэю":
+        stem = clean[:-1]
+        return rf"\b{re.escape(stem)}[а-яё]{{0,3}}\b"
+    return rf"\b{re.escape(clean)}[а-яё]{{0,3}}\b"
+
+
 async def evaluate_group_batch_and_decide(
     session: AsyncSession,
     group_id: int,
@@ -255,7 +264,8 @@ async def evaluate_group_batch_and_decide(
     persona = await resolve_effective_persona(session, group)
 
     bot_username = (sys_cfg.bot_username or "").lower().lstrip("@") if sys_cfg else ""
-    persona_name_lower = (persona.get("display_name") or "").lower()
+    persona_name_lower = (persona.get("display_name") or "").strip().lower()
+    persona_name_pattern = _build_persona_name_pattern(persona_name_lower) if len(persona_name_lower) >= 3 else None
 
     # Загружаем окно последних сообщений
     window_size = max(10, g_settings.context_window_messages)
@@ -287,10 +297,9 @@ async def evaluate_group_batch_and_decide(
         if bot_username and f"@{bot_username}" in txt_low:
             is_direct_ping = True
             break
-        if persona_name_lower and len(persona_name_lower) >= 3:
-            if re.search(rf"\b{re.escape(persona_name_lower)}\b", txt_low):
-                is_direct_ping = True
-                break
+        if persona_name_pattern and re.search(persona_name_pattern, txt_low):
+            is_direct_ping = True
+            break
 
     now_utc = datetime.now(timezone.utc)
 
