@@ -25,8 +25,12 @@ from app.schemas import (
     MemoryEpisodeOut,
     MemoryEpisodeUpdate,
     PollPayloadSchema,
+    SandboxChatRequest,
+    SandboxChatResponse,
+    SandboxProactiveRequest,
+    SandboxProactiveResponse,
 )
-from app.services.decision_service import generate_poll_via_llm, sanitize_poll_params
+from app.services.decision_service import generate_poll_via_llm, sanitize_poll_params, simulate_tagged_reply
 from app.services.import_service import import_telegram_desktop_files
 from app.services.llm_service import create_embedding
 from app.services.memory_service import (
@@ -35,7 +39,7 @@ from app.services.memory_service import (
     resolve_effective_persona,
     search_relevant_episodes,
 )
-from app.services.proactive_service import generate_and_send_proactive_message
+from app.services.proactive_service import generate_and_send_proactive_message, simulate_proactive_message
 
 router = APIRouter(prefix="/api/groups", tags=["groups"], dependencies=[Depends(require_admin)])
 
@@ -430,6 +434,47 @@ async def force_trigger_proactive(
     session: AsyncSession = Depends(get_db),
 ) -> dict:
     return await generate_and_send_proactive_message(session, group_id, manual_trigger=True)
+
+
+# ==========================================
+# Sandbox (Admin Test Chat without DB writes)
+# ==========================================
+@router.post("/{group_id}/sandbox/chat", response_model=SandboxChatResponse)
+async def sandbox_chat_reply(
+    group_id: int,
+    payload: SandboxChatRequest,
+    session: AsyncSession = Depends(get_db),
+) -> SandboxChatResponse:
+    try:
+        res = await simulate_tagged_reply(
+            session=session,
+            group_id=group_id,
+            sandbox_messages=[m.model_dump() for m in payload.messages],
+            include_real_history=payload.include_real_history,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return SandboxChatResponse(**res)
+
+
+@router.post("/{group_id}/sandbox/proactive", response_model=SandboxProactiveResponse)
+async def sandbox_proactive_test(
+    group_id: int,
+    payload: SandboxProactiveRequest,
+    session: AsyncSession = Depends(get_db),
+) -> SandboxProactiveResponse:
+    try:
+        res = await simulate_proactive_message(
+            session=session,
+            group_id=group_id,
+            mode=payload.mode,
+            silence_hours_override=payload.silence_hours_override,
+            sandbox_messages=[m.model_dump() for m in payload.sandbox_messages],
+            include_real_history=payload.include_real_history,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return SandboxProactiveResponse(**res)
 
 
 @router.post("/{group_id}/import", response_model=ImportHistoryResponse)

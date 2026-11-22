@@ -242,3 +242,38 @@ export interface PromptTemplateSpec {
   variables: PromptVariableDoc[];
 }
 
+export interface SandboxChatMessage {
+  role: 'user' | 'bot';
+  text: string;
+  sender_name?: string | null;
+  member_id?: string | null;
+  created_at?: string | null;
+}
+
+export interface SandboxChatResponse {
+  action: 'ignore' | 'react' | 'reply' | 'message' | 'poll';
+  text?: string | null;
+  emoji?: string | null;
+  poll_data?: Record<string, any> | null;
+  reasoning: string;
+  persona_name: string;
+  model_used: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd: number;
+  retrieved_context_meta: Record<string, any>;
+}
+
+export interface SandboxProactiveResponse {
+  text: string;
+  new_topic_mode: boolean;
+  silence_hours: number;
+  persona_name: string;
+  gate_notes: string[];
+  model_used: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd: number;
+  retrieved_context_meta: Record<string, any>;
+}
+

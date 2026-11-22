@@ -1,16 +1,16 @@
 import logging
 import random
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models import DecisionLog, Group, GroupMember, Message
+from app.models import DecisionLog, Group, GroupMember, GroupSettings, Message
 from app.redis_client import publish_bot_command, publish_group_event
-from app.services.decision_service import humanize_bot_text, is_within_quiet_hours
-from app.services.llm_service import complete_text
+from app.services.decision_service import build_ephemeral_messages, humanize_bot_text, is_within_quiet_hours
+from app.services.llm_service import LLMUsage, complete_text
 from app.services.memory_service import (
     build_persona_generation_context,
     ensure_group_initialized,
@@ -23,39 +23,25 @@ from app.services.prompt_service import render_prompt
 logger = logging.getLogger(__name__)
 
 
-async def generate_and_send_proactive_message(
+async def _generate_proactive_draft(
     session: AsyncSession,
-    group_id: int,
-    manual_trigger: bool = False,
-) -> dict[str, Any]:
-    """Генерирует естественный повод начать диалог в затихшей группе и отправляет через bot-gateway."""
-    group = await ensure_group_initialized(session, group_id)
-    persona = await resolve_effective_persona(session, group)
-    g_settings = group.settings
-
-    recent_stmt = (
-        select(Message)
-        .where(Message.group_id == group_id)
-        .order_by(Message.created_at.desc())
-        .limit(20)
-    )
-    recent_msgs = list(reversed((await session.execute(recent_stmt)).scalars().all()))
-
-    # Также загружаем самых активных участников группы, даже если в последних 20 сообщениях их было мало
+    group: Group,
+    g_settings: GroupSettings,
+    persona: dict[str, Any],
+    recent_msgs: list[Message],
+    start_new_topic: bool,
+    silence_hours: float,
+    now_utc: datetime,
+) -> tuple[str, dict[str, Any], LLMUsage]:
+    """Собирает промпт инициативы (revive или new_topic) и вызывает Smart LLM без побочных эффектов."""
     top_members_stmt = (
         select(GroupMember)
         .options(selectinload(GroupMember.facts))
-        .where(GroupMember.group_id == group_id)
+        .where(GroupMember.group_id == group.id)
         .order_by(GroupMember.message_count.desc())
         .limit(8)
     )
     top_members = list((await session.execute(top_members_stmt)).scalars().all())
-
-    now_utc = datetime.now(timezone.utc)
-    last_msg_dt = group.last_message_at or (recent_msgs[-1].created_at if recent_msgs else None)
-    silence_hours = ((now_utc - last_msg_dt).total_seconds() / 3600.0) if last_msg_dt else 999.0
-    threshold_hours = float(getattr(g_settings, "new_topic_after_hours", 4.0) or 0.0)
-    start_new_topic = silence_hours >= threshold_hours
 
     sys_prompt, context_meta = await build_persona_generation_context(
         session=session,
@@ -103,6 +89,47 @@ async def generate_and_send_proactive_message(
         max_tokens=350,
     )
     text_out = humanize_bot_text(text_out, persona.get("display_name", ""))
+    context_meta["llm_prompts"] = {
+        "smart_system_prompt": sys_prompt,
+        "smart_user_prompt": user_prompt,
+    }
+    return text_out, context_meta, usage
+
+
+async def generate_and_send_proactive_message(
+    session: AsyncSession,
+    group_id: int,
+    manual_trigger: bool = False,
+) -> dict[str, Any]:
+    """Генерирует естественный повод начать диалог в затихшей группе и отправляет через bot-gateway."""
+    group = await ensure_group_initialized(session, group_id)
+    persona = await resolve_effective_persona(session, group)
+    g_settings = group.settings
+
+    recent_stmt = (
+        select(Message)
+        .where(Message.group_id == group_id)
+        .order_by(Message.created_at.desc())
+        .limit(20)
+    )
+    recent_msgs = list(reversed((await session.execute(recent_stmt)).scalars().all()))
+
+    now_utc = datetime.now(timezone.utc)
+    last_msg_dt = group.last_message_at or (recent_msgs[-1].created_at if recent_msgs else None)
+    silence_hours = ((now_utc - last_msg_dt).total_seconds() / 3600.0) if last_msg_dt else 999.0
+    threshold_hours = float(getattr(g_settings, "new_topic_after_hours", 4.0) or 0.0)
+    start_new_topic = silence_hours >= threshold_hours
+
+    text_out, context_meta, usage = await _generate_proactive_draft(
+        session=session,
+        group=group,
+        g_settings=g_settings,
+        persona=persona,
+        recent_msgs=recent_msgs,
+        start_new_topic=start_new_topic,
+        silence_hours=silence_hours,
+        now_utc=now_utc,
+    )
     if not text_out:
         return {"status": "empty_response"}
 
@@ -119,10 +146,6 @@ async def generate_and_send_proactive_message(
         if manual_trigger
         else f"Спонтанная инициатива бота в период затишья: {mode_label}."
     )
-    context_meta["llm_prompts"] = {
-        "smart_system_prompt": sys_prompt,
-        "smart_user_prompt": user_prompt,
-    }
     log_entry = DecisionLog(
         group_id=group_id,
         trigger_tg_msg_ids=[],
@@ -162,6 +185,130 @@ async def generate_and_send_proactive_message(
         },
     )
     return {"status": "sent", "text": text_out, "new_topic_mode": start_new_topic}
+
+
+async def simulate_proactive_message(
+    session: AsyncSession,
+    group_id: int,
+    mode: str = "auto",
+    silence_hours_override: Optional[float] = None,
+    sandbox_messages: Optional[list[dict[str, Any]]] = None,
+    include_real_history: bool = True,
+) -> dict[str, Any]:
+    """
+    Эфемерная симуляция спонтанной инициативы бота для песочницы админки:
+    - НЕ меняет last_proactive_at / unanswered_initiatives;
+    - НЕ пишет DecisionLog и НЕ отправляет сообщение в Telegram;
+    - дополнительно возвращает диагностику gate_notes о готовности реального планировщика.
+    """
+    stmt = (
+        select(Group)
+        .options(selectinload(Group.settings), selectinload(Group.context))
+        .where(Group.id == group_id)
+    )
+    group = (await session.execute(stmt)).scalars().first()
+    if not group:
+        raise ValueError("Группа не найдена")
+
+    g_settings = group.settings or GroupSettings(group_id=group_id)
+    persona = await resolve_effective_persona(session, group)
+    persona_name = str(persona.get("display_name") or "Бот")
+    now_utc = datetime.now(timezone.utc)
+
+    gate_notes: list[str] = []
+    if not group.is_active:
+        gate_notes.append("Бот на паузе в этой группе (is_active = false)")
+    if not g_settings.proactive_enabled or g_settings.proactive_chance_per_hour <= 0:
+        gate_notes.append("Инициатива выключена или шанс равен 0% в настройках группы")
+    if (group.unanswered_initiatives or 0) >= 1:
+        gate_notes.append(
+            f"Anti-Spam Guard: уже есть {group.unanswered_initiatives} безответная инициатива — бот ждёт реакции в реальном чате"
+        )
+    if g_settings.quiet_hours_enabled and is_within_quiet_hours(
+        g_settings.timezone, g_settings.quiet_hours_start, g_settings.quiet_hours_end, now_utc
+    ):
+        gate_notes.append(
+            f"Сейчас тихие часы ({g_settings.quiet_hours_start}–{g_settings.quiet_hours_end}, {g_settings.timezone})"
+        )
+    if group.last_message_at:
+        silence_min = (now_utc - group.last_message_at).total_seconds() / 60.0
+        if silence_min < g_settings.min_silence_minutes:
+            gate_notes.append(
+                f"В чате ещё не прошло {g_settings.min_silence_minutes} мин тишины (сейчас {int(silence_min)} мин)"
+            )
+    if group.last_proactive_at:
+        hours_since = (now_utc - group.last_proactive_at).total_seconds() / 3600.0
+        if hours_since < g_settings.proactive_cooldown_hours:
+            gate_notes.append(
+                f"Ещё действует кулдаун инициативы ({hours_since:.1f}ч < {g_settings.proactive_cooldown_hours}ч)"
+            )
+    if not gate_notes:
+        gate_notes.append("Все условия планировщика выполнены — инициатива может сработать в реале")
+
+    real_msgs: list[Message] = []
+    if include_real_history:
+        recent_stmt = (
+            select(Message)
+            .where(Message.group_id == group_id)
+            .order_by(Message.created_at.desc())
+            .limit(20)
+        )
+        real_msgs = list(reversed((await session.execute(recent_stmt)).scalars().all()))
+
+    max_real_id = max((m.telegram_message_id for m in real_msgs), default=0)
+    ephemeral_msgs = await build_ephemeral_messages(
+        session=session,
+        group_id=group_id,
+        sandbox_messages=sandbox_messages or [],
+        persona_name=persona_name,
+        start_msg_id=max(max_real_id + 1, 100001),
+        now_utc=now_utc,
+    )
+    recent_msgs = (real_msgs + ephemeral_msgs)[-20:]
+
+    if silence_hours_override is not None:
+        silence_hours = float(silence_hours_override)
+    else:
+        last_msg_dt = (
+            ephemeral_msgs[-1].created_at
+            if ephemeral_msgs
+            else (group.last_message_at or (real_msgs[-1].created_at if real_msgs else None))
+        )
+        silence_hours = max(0.0, (now_utc - last_msg_dt).total_seconds() / 3600.0) if last_msg_dt else 999.0
+
+    threshold_hours = float(getattr(g_settings, "new_topic_after_hours", 4.0) or 0.0)
+    if mode == "new_topic":
+        start_new_topic = True
+    elif mode == "revive":
+        start_new_topic = False
+    else:
+        start_new_topic = silence_hours >= threshold_hours
+
+    text_out, context_meta, usage = await _generate_proactive_draft(
+        session=session,
+        group=group,
+        g_settings=g_settings,
+        persona=persona,
+        recent_msgs=recent_msgs,
+        start_new_topic=start_new_topic,
+        silence_hours=silence_hours,
+        now_utc=now_utc,
+    )
+    if not text_out:
+        gate_notes.append("Модель вернула пустой ответ")
+
+    return {
+        "text": text_out,
+        "new_topic_mode": start_new_topic,
+        "silence_hours": round(silence_hours, 2),
+        "persona_name": persona_name,
+        "gate_notes": gate_notes,
+        "model_used": usage.model,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "cost_usd": usage.cost_usd,
+        "retrieved_context_meta": context_meta,
+    }
 
 
 async def check_all_groups_for_proactive_initiative(session: AsyncSession) -> int:

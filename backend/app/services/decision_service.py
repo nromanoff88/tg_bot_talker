@@ -1,6 +1,7 @@
 import logging
 import random
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
@@ -8,8 +9,9 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from app.models import DecisionLog, GroupMember, Message, SystemConfig
+from app.models import DecisionLog, Group, GroupMember, GroupSettings, Message, SystemConfig
 from app.redis_client import publish_group_event
 from app.services.llm_service import LLMUsage, complete_json, complete_text
 from app.services.memory_service import (
@@ -246,6 +248,247 @@ def _build_persona_name_pattern(name: str) -> str:
     return rf"\b{re.escape(clean)}[а-яё]{{0,3}}\b"
 
 
+async def _run_router_and_plan(
+    session: AsyncSession,
+    group: Group,
+    g_settings: GroupSettings,
+    persona: dict[str, Any],
+    recent_msgs: list[Message],
+    trigger_msgs: list[Message],
+    trigger_set: set[int],
+    effective_chattiness: float,
+    router_direct_ping: bool,
+    now_str: str,
+) -> tuple[str, int, str, dict[str, Any], dict[str, str], LLMUsage]:
+    """Собирает контекст для Fast LLM Router и возвращает (action, target_msg_id, reasoning, router_json, router_prompts, router_usage)."""
+    author_ids = {m.member_id for m in recent_msgs[-15:] if m.member_id}
+    brief_authors = []
+    if author_ids:
+        m_rows = (
+            await session.execute(select(GroupMember).where(GroupMember.id.in_(author_ids)))
+        ).scalars().all()
+        for mr in m_rows:
+            brief_authors.append(
+                f"- {mr.display_name}: {mr.character_summary[:140] or 'участник чата'}"
+                + (f" (отношение: {mr.bot_attitude[:80]})" if mr.bot_attitude else "")
+            )
+
+    chat_lines = []
+    for m in recent_msgs[-22:]:
+        who = f"{persona['display_name']} [ТЫ]" if m.is_from_bot else m.sender_name
+        r_tag = f" (reply->#{m.reply_to_tg_msg_id})" if m.reply_to_tg_msg_id else ""
+        new_tag = " [НОВОЕ]" if m.telegram_message_id in trigger_set else ""
+        ts = format_message_local_ts(m.created_at, g_settings.timezone)
+        chat_lines.append(f"#{m.telegram_message_id}{new_tag} [{ts}] {who}{r_tag}: {m.text_content}")
+
+    router_sys_prompt = await render_prompt(
+        session,
+        "router_system_prompt",
+        {"group_title": group.title, "current_datetime": now_str},
+    )
+    router_user_prompt = await render_prompt(
+        session,
+        "router_user_prompt",
+        {
+            "group_title": group.title,
+            "current_datetime": now_str,
+            "persona": persona,
+            "chattiness_level": effective_chattiness,
+            "is_direct_ping": router_direct_ping,
+            "reactions_enabled": g_settings.reactions_enabled,
+            "allowed_emojis": g_settings.allowed_emojis,
+            "brief_authors": "\n".join(brief_authors) or "нет данных",
+            "chat_messages": "\n".join(chat_lines),
+        },
+    )
+
+    router_json, router_usage = await complete_json(
+        session=session,
+        tier="fast",
+        system_prompt=router_sys_prompt,
+        user_prompt=router_user_prompt,
+        temperature=0.35,
+        max_tokens=450,
+    )
+
+    raw_action = str(router_json.get("action") or "ignore").strip().lower()
+    if raw_action not in ("ignore", "react", "reply", "message", "poll"):
+        raw_action = "ignore"
+
+    reasoning = str(router_json.get("reasoning") or "Решение принято классификатором.").strip()
+    target_id_raw = router_json.get("target_tg_msg_id")
+    valid_msg_ids = {m.telegram_message_id for m in recent_msgs}
+    target_msg_id = (
+        int(target_id_raw)
+        if isinstance(target_id_raw, (int, str)) and str(target_id_raw).lstrip("-").isdigit() and int(target_id_raw) in valid_msg_ids
+        else trigger_msgs[-1].telegram_message_id
+    )
+
+    if raw_action == "react" and not g_settings.reactions_enabled:
+        raw_action = "ignore"
+        reasoning += " (Реакции отключены в настройках группы)."
+
+    router_prompts = {
+        "router_system_prompt": router_sys_prompt,
+        "router_user_prompt": router_user_prompt,
+    }
+    return raw_action, target_msg_id, reasoning, router_json, router_prompts, router_usage
+
+
+async def _generate_reply_text(
+    session: AsyncSession,
+    group: Group,
+    g_settings: GroupSettings,
+    persona: dict[str, Any],
+    recent_msgs: list[Message],
+    trigger_msgs: list[Message],
+    raw_action: str,
+    target_msg_id: int,
+    reasoning: str,
+    router_json: dict[str, Any],
+    router_prompts: dict[str, str],
+    is_direct_ping_meta: bool,
+    now_str: str,
+) -> tuple[str, dict[str, Any], LLMUsage]:
+    """Строит 3-слойный контекст памяти и генерирует текстовый ответ Smart LLM."""
+    need_mem = bool(router_json.get("need_memory_search"))
+    mem_query = str(router_json.get("memory_query") or "").strip() if need_mem else ""
+    if not mem_query and len(trigger_msgs[-1].text_content) > 20:
+        mem_query = trigger_msgs[-1].text_content[:200]
+
+    sys_prompt, context_meta = await build_persona_generation_context(
+        session=session,
+        group=group,
+        recent_messages=recent_msgs,
+        memory_query=mem_query,
+    )
+    context_meta["is_direct_ping"] = is_direct_ping_meta
+    context_meta["router_action"] = raw_action
+
+    full_chat_lines = []
+    for m in recent_msgs:
+        who = f"{persona['display_name']} (ТЫ)" if m.is_from_bot else m.sender_name
+        r_tag = f" [ответ на #{m.reply_to_tg_msg_id}]" if m.reply_to_tg_msg_id else ""
+        ts = format_message_local_ts(m.created_at, g_settings.timezone)
+        full_chat_lines.append(f"#{m.telegram_message_id} [{ts}] {who}{r_tag}: {m.text_content}")
+
+    reply_instruction = (
+        f"Напиши естественный живой ответ реплаем на сообщение #{target_msg_id}."
+        if raw_action == "reply"
+        else "Напиши естественную реплику в общий разговор чата."
+    )
+
+    gen_user_prompt = await render_prompt(
+        session,
+        "reply_user_prompt",
+        {
+            "chat_history": "\n".join(full_chat_lines),
+            "reasoning": reasoning,
+            "reply_instruction": reply_instruction,
+            "action": raw_action,
+            "target_msg_id": target_msg_id,
+            "current_datetime": now_str,
+        },
+    )
+    context_meta["llm_prompts"] = {
+        **router_prompts,
+        "smart_system_prompt": sys_prompt,
+        "smart_user_prompt": gen_user_prompt,
+    }
+
+    reply_text, smart_usage = await complete_text(
+        session=session,
+        tier="smart",
+        system_prompt=sys_prompt,
+        user_prompt=gen_user_prompt,
+        temperature=0.85,
+        max_tokens=500,
+    )
+    reply_text = humanize_bot_text(reply_text, persona.get("display_name", ""))
+    return reply_text, context_meta, smart_usage
+
+
+async def build_ephemeral_messages(
+    session: AsyncSession,
+    group_id: int,
+    sandbox_messages: list[dict[str, Any]],
+    persona_name: str,
+    start_msg_id: int = 100001,
+    now_utc: Optional[datetime] = None,
+) -> list[Message]:
+    """Создаёт временные объекты Message для песочницы без добавления их в SQLAlchemy session."""
+    if not sandbox_messages:
+        return []
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    member_uuids: set[uuid.UUID] = set()
+    for item in sandbox_messages:
+        raw_mid = item.get("member_id")
+        if isinstance(raw_mid, uuid.UUID):
+            member_uuids.add(raw_mid)
+        elif isinstance(raw_mid, str) and raw_mid.strip():
+            try:
+                member_uuids.add(uuid.UUID(raw_mid.strip()))
+            except ValueError:
+                pass
+
+    members_by_id: dict[uuid.UUID, GroupMember] = {}
+    if member_uuids:
+        rows = (
+            await session.execute(
+                select(GroupMember).where(GroupMember.group_id == group_id, GroupMember.id.in_(member_uuids))
+            )
+        ).scalars().all()
+        members_by_id = {m.id: m for m in rows}
+
+    ephemeral: list[Message] = []
+    total = len(sandbox_messages)
+    for idx, item in enumerate(sandbox_messages):
+        role = item.get("role", "user")
+        is_from_bot = role == "bot"
+        member_obj: Optional[GroupMember] = None
+        if not is_from_bot and item.get("member_id"):
+            try:
+                mid = item["member_id"] if isinstance(item["member_id"], uuid.UUID) else uuid.UUID(str(item["member_id"]))
+                member_obj = members_by_id.get(mid)
+            except ValueError:
+                member_obj = None
+
+        if is_from_bot:
+            sender_name = persona_name or "Бот"
+            sender_username = None
+        elif member_obj is not None:
+            sender_name = member_obj.display_name
+            sender_username = member_obj.username
+        else:
+            sender_name = (str(item.get("sender_name") or "").strip() or "Админ")[:255]
+            sender_username = None
+
+        raw_dt = item.get("created_at")
+        if isinstance(raw_dt, datetime):
+            msg_dt = raw_dt if raw_dt.tzinfo is not None else raw_dt.replace(tzinfo=timezone.utc)
+        else:
+            msg_dt = now_utc - timedelta(seconds=(total - idx))
+
+        ephemeral.append(
+            Message(
+                group_id=group_id,
+                telegram_message_id=start_msg_id + idx,
+                member_id=member_obj.id if member_obj else None,
+                sender_name=sender_name,
+                sender_username=sender_username,
+                is_from_bot=is_from_bot,
+                reply_to_tg_msg_id=None,
+                text_content=str(item.get("text") or "").strip(),
+                reactions={},
+                is_imported=False,
+                is_processed_for_memory=True,
+                created_at=msg_dt,
+            )
+        )
+    return ephemeral
+
+
 async def evaluate_group_batch_and_decide(
     session: AsyncSession,
     group_id: int,
@@ -371,79 +614,20 @@ async def evaluate_group_batch_and_decide(
             )
             return BotDecisionResult(action="ignore", reasoning=reason)
 
-    # Собираем краткие карточки авторов для быстрого роутера
-    author_ids = {m.member_id for m in recent_msgs[-15:] if m.member_id}
-    brief_authors = []
-    if author_ids:
-        m_rows = (
-            await session.execute(select(GroupMember).where(GroupMember.id.in_(author_ids)))
-        ).scalars().all()
-        for mr in m_rows:
-            brief_authors.append(
-                f"- {mr.display_name}: {mr.character_summary[:140] or 'участник чата'}"
-                + (f" (отношение: {mr.bot_attitude[:80]})" if mr.bot_attitude else "")
-            )
-
+    # Собираем контекст и спрашиваем Fast LLM Роутер
     now_str = format_current_datetime_context(g_settings.timezone, now_utc)
-    chat_lines = []
-    for m in recent_msgs[-22:]:
-        who = f"{persona['display_name']} [ТЫ]" if m.is_from_bot else m.sender_name
-        r_tag = f" (reply->#{m.reply_to_tg_msg_id})" if m.reply_to_tg_msg_id else ""
-        new_tag = " [НОВОЕ]" if m.telegram_message_id in trigger_set else ""
-        ts = format_message_local_ts(m.created_at, g_settings.timezone)
-        chat_lines.append(f"#{m.telegram_message_id}{new_tag} [{ts}] {who}{r_tag}: {m.text_content}")
-
-    router_sys_prompt = await render_prompt(
-        session,
-        "router_system_prompt",
-        {"group_title": group.title, "current_datetime": now_str},
-    )
-    router_user_prompt = await render_prompt(
-        session,
-        "router_user_prompt",
-        {
-            "group_title": group.title,
-            "current_datetime": now_str,
-            "persona": persona,
-            "chattiness_level": effective_chattiness,
-            "is_direct_ping": is_direct_ping and g_settings.reply_on_mention,
-            "reactions_enabled": g_settings.reactions_enabled,
-            "allowed_emojis": g_settings.allowed_emojis,
-            "brief_authors": "\n".join(brief_authors) or "нет данных",
-            "chat_messages": "\n".join(chat_lines),
-        },
-    )
-
-    router_json, router_usage = await complete_json(
+    raw_action, target_msg_id, reasoning, router_json, router_prompts, router_usage = await _run_router_and_plan(
         session=session,
-        tier="fast",
-        system_prompt=router_sys_prompt,
-        user_prompt=router_user_prompt,
-        temperature=0.35,
-        max_tokens=450,
+        group=group,
+        g_settings=g_settings,
+        persona=persona,
+        recent_msgs=recent_msgs,
+        trigger_msgs=trigger_msgs,
+        trigger_set=trigger_set,
+        effective_chattiness=effective_chattiness,
+        router_direct_ping=is_direct_ping and g_settings.reply_on_mention,
+        now_str=now_str,
     )
-
-    raw_action = str(router_json.get("action") or "ignore").strip().lower()
-    if raw_action not in ("ignore", "react", "reply", "message", "poll"):
-        raw_action = "ignore"
-
-    reasoning = str(router_json.get("reasoning") or "Решение принято классификатором.").strip()
-    target_id_raw = router_json.get("target_tg_msg_id")
-    valid_msg_ids = {m.telegram_message_id for m in recent_msgs}
-    target_msg_id = (
-        int(target_id_raw)
-        if isinstance(target_id_raw, (int, str)) and str(target_id_raw).lstrip("-").isdigit() and int(target_id_raw) in valid_msg_ids
-        else trigger_msgs[-1].telegram_message_id
-    )
-
-    if raw_action == "react" and not g_settings.reactions_enabled:
-        raw_action = "ignore"
-        reasoning += " (Реакции отключены в настройках группы)."
-
-    router_prompts = {
-        "router_system_prompt": router_sys_prompt,
-        "router_user_prompt": router_user_prompt,
-    }
 
     # Ветка 1: Промолчать
     if raw_action == "ignore":
@@ -519,60 +703,21 @@ async def evaluate_group_batch_and_decide(
         )
 
     # Ветка 3: Ответить текстом (reply или message) через Smart LLM + 3-слойную память
-    need_mem = bool(router_json.get("need_memory_search"))
-    mem_query = str(router_json.get("memory_query") or "").strip() if need_mem else ""
-    if not mem_query and len(trigger_msgs[-1].text_content) > 20:
-        mem_query = trigger_msgs[-1].text_content[:200]
-
-    sys_prompt, context_meta = await build_persona_generation_context(
+    reply_text, context_meta, smart_usage = await _generate_reply_text(
         session=session,
         group=group,
-        recent_messages=recent_msgs,
-        memory_query=mem_query,
+        g_settings=g_settings,
+        persona=persona,
+        recent_msgs=recent_msgs,
+        trigger_msgs=trigger_msgs,
+        raw_action=raw_action,
+        target_msg_id=target_msg_id,
+        reasoning=reasoning,
+        router_json=router_json,
+        router_prompts=router_prompts,
+        is_direct_ping_meta=is_direct_ping,
+        now_str=now_str,
     )
-    context_meta["is_direct_ping"] = is_direct_ping
-    context_meta["router_action"] = raw_action
-
-    full_chat_lines = []
-    for m in recent_msgs:
-        who = f"{persona['display_name']} (ТЫ)" if m.is_from_bot else m.sender_name
-        r_tag = f" [ответ на #{m.reply_to_tg_msg_id}]" if m.reply_to_tg_msg_id else ""
-        ts = format_message_local_ts(m.created_at, g_settings.timezone)
-        full_chat_lines.append(f"#{m.telegram_message_id} [{ts}] {who}{r_tag}: {m.text_content}")
-
-    reply_instruction = (
-        f"Напиши естественный живой ответ реплаем на сообщение #{target_msg_id}."
-        if raw_action == "reply"
-        else "Напиши естественную реплику в общий разговор чата."
-    )
-
-    gen_user_prompt = await render_prompt(
-        session,
-        "reply_user_prompt",
-        {
-            "chat_history": "\n".join(full_chat_lines),
-            "reasoning": reasoning,
-            "reply_instruction": reply_instruction,
-            "action": raw_action,
-            "target_msg_id": target_msg_id,
-            "current_datetime": now_str,
-        },
-    )
-    context_meta["llm_prompts"] = {
-        **router_prompts,
-        "smart_system_prompt": sys_prompt,
-        "smart_user_prompt": gen_user_prompt,
-    }
-
-    reply_text, smart_usage = await complete_text(
-        session=session,
-        tier="smart",
-        system_prompt=sys_prompt,
-        user_prompt=gen_user_prompt,
-        temperature=0.85,
-        max_tokens=500,
-    )
-    reply_text = humanize_bot_text(reply_text, persona.get("display_name", ""))
     total_usage = router_usage + smart_usage
 
     if not reply_text:
@@ -599,6 +744,181 @@ async def evaluate_group_batch_and_decide(
         simulate_typing=g_settings.simulate_typing,
         reasoning=reasoning,
     )
+
+
+async def simulate_tagged_reply(
+    session: AsyncSession,
+    group_id: int,
+    sandbox_messages: list[dict[str, Any]],
+    include_real_history: bool = True,
+) -> dict[str, Any]:
+    """
+    Эфемерная симуляция ответа бота в песочнице админки (как при прямом теге в Telegram):
+    - читает текущую память группы, участников и настройки;
+    - НЕ сохраняет сообщения, НЕ пишет DecisionLog и НЕ отправляет ничего в Telegram.
+    """
+    stmt = (
+        select(Group)
+        .options(selectinload(Group.settings), selectinload(Group.context))
+        .where(Group.id == group_id)
+    )
+    group = (await session.execute(stmt)).scalars().first()
+    if not group:
+        raise ValueError("Группа не найдена")
+
+    g_settings = group.settings or GroupSettings(group_id=group_id)
+    persona = await resolve_effective_persona(session, group)
+    persona_name = str(persona.get("display_name") or "Бот")
+
+    real_msgs: list[Message] = []
+    window_size = max(10, g_settings.context_window_messages)
+    if include_real_history:
+        recent_stmt = (
+            select(Message)
+            .where(Message.group_id == group_id)
+            .order_by(Message.created_at.desc())
+            .limit(window_size)
+        )
+        real_msgs = list(reversed((await session.execute(recent_stmt)).scalars().all()))
+
+    now_utc = datetime.now(timezone.utc)
+    max_real_id = max((m.telegram_message_id for m in real_msgs), default=0)
+    ephemeral_msgs = await build_ephemeral_messages(
+        session=session,
+        group_id=group_id,
+        sandbox_messages=sandbox_messages,
+        persona_name=persona_name,
+        start_msg_id=max(max_real_id + 1, 100001),
+        now_utc=now_utc,
+    )
+    if not ephemeral_msgs:
+        raise ValueError("Передайте хотя бы одно сообщение для диалога.")
+
+    recent_msgs = (real_msgs + ephemeral_msgs)[-window_size:]
+    trigger_msgs = [ephemeral_msgs[-1]]
+    trigger_set = {m.telegram_message_id for m in trigger_msgs}
+    now_str = format_current_datetime_context(g_settings.timezone, now_utc)
+
+    raw_action, target_msg_id, reasoning, router_json, router_prompts, router_usage = await _run_router_and_plan(
+        session=session,
+        group=group,
+        g_settings=g_settings,
+        persona=persona,
+        recent_msgs=recent_msgs,
+        trigger_msgs=trigger_msgs,
+        trigger_set=trigger_set,
+        effective_chattiness=g_settings.chattiness_level,
+        router_direct_ping=True,
+        now_str=now_str,
+    )
+
+    if raw_action == "ignore":
+        return {
+            "action": "ignore",
+            "text": None,
+            "emoji": None,
+            "poll_data": None,
+            "reasoning": reasoning,
+            "persona_name": persona_name,
+            "model_used": router_usage.model,
+            "prompt_tokens": router_usage.prompt_tokens,
+            "completion_tokens": router_usage.completion_tokens,
+            "cost_usd": router_usage.cost_usd,
+            "retrieved_context_meta": {"is_direct_ping": True, "llm_prompts": router_prompts},
+        }
+
+    if raw_action == "react":
+        allowed = g_settings.allowed_emojis or ["👍"]
+        chosen_emoji = str(router_json.get("emoji") or "").strip()
+        if chosen_emoji not in allowed:
+            chosen_emoji = allowed[0]
+        return {
+            "action": "react",
+            "text": None,
+            "emoji": chosen_emoji,
+            "poll_data": None,
+            "reasoning": reasoning,
+            "persona_name": persona_name,
+            "model_used": router_usage.model,
+            "prompt_tokens": router_usage.prompt_tokens,
+            "completion_tokens": router_usage.completion_tokens,
+            "cost_usd": router_usage.cost_usd,
+            "retrieved_context_meta": {"is_direct_ping": True, "llm_prompts": router_prompts},
+        }
+
+    if raw_action == "poll":
+        poll_data, poll_ctx_meta, poll_usage = await generate_poll_via_llm(
+            session=session,
+            group_id=group_id,
+            recent_msgs=recent_msgs,
+            topic_hint=f"{reasoning} | Последняя реплика: {trigger_msgs[-1].text_content[:200]}",
+        )
+        poll_ctx_meta["is_direct_ping"] = True
+        poll_ctx_meta["router_action"] = "poll"
+        poll_ctx_meta["llm_prompts"] = {
+            **router_prompts,
+            **(poll_ctx_meta.get("llm_prompts") or {}),
+        }
+        total_usage = router_usage + poll_usage
+        return {
+            "action": "poll",
+            "text": None,
+            "emoji": None,
+            "poll_data": poll_data,
+            "reasoning": reasoning,
+            "persona_name": persona_name,
+            "model_used": total_usage.model,
+            "prompt_tokens": total_usage.prompt_tokens,
+            "completion_tokens": total_usage.completion_tokens,
+            "cost_usd": total_usage.cost_usd,
+            "retrieved_context_meta": poll_ctx_meta,
+        }
+
+    reply_text, context_meta, smart_usage = await _generate_reply_text(
+        session=session,
+        group=group,
+        g_settings=g_settings,
+        persona=persona,
+        recent_msgs=recent_msgs,
+        trigger_msgs=trigger_msgs,
+        raw_action=raw_action,
+        target_msg_id=target_msg_id,
+        reasoning=reasoning,
+        router_json=router_json,
+        router_prompts=router_prompts,
+        is_direct_ping_meta=True,
+        now_str=now_str,
+    )
+    total_usage = router_usage + smart_usage
+
+    if not reply_text:
+        return {
+            "action": "ignore",
+            "text": None,
+            "emoji": None,
+            "poll_data": None,
+            "reasoning": "Пустой ответ от модели.",
+            "persona_name": persona_name,
+            "model_used": total_usage.model,
+            "prompt_tokens": total_usage.prompt_tokens,
+            "completion_tokens": total_usage.completion_tokens,
+            "cost_usd": total_usage.cost_usd,
+            "retrieved_context_meta": context_meta,
+        }
+
+    return {
+        "action": raw_action,
+        "text": reply_text,
+        "emoji": None,
+        "poll_data": None,
+        "reasoning": reasoning,
+        "persona_name": persona_name,
+        "model_used": total_usage.model,
+        "prompt_tokens": total_usage.prompt_tokens,
+        "completion_tokens": total_usage.completion_tokens,
+        "cost_usd": total_usage.cost_usd,
+        "retrieved_context_meta": context_meta,
+    }
 
 
 async def _save_decision_log(

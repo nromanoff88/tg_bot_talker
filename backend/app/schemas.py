@@ -384,3 +384,53 @@ class ImportHistoryResponse(BaseModel):
     discovered_members: int
     queued_analysis_batches: int
 
+
+# ==========================================
+# Sandbox (Admin Test Chat without DB persistence)
+# ==========================================
+class SandboxChatMessage(BaseModel):
+    role: Literal["user", "bot"]
+    text: str = Field(min_length=1, max_length=4000)
+    sender_name: Optional[str] = Field(default=None, max_length=255)
+    member_id: Optional[uuid.UUID] = None
+    created_at: Optional[datetime] = None
+
+
+class SandboxChatRequest(BaseModel):
+    messages: list[SandboxChatMessage] = Field(min_length=1, max_length=50)
+    include_real_history: bool = True
+
+
+class SandboxChatResponse(BaseModel):
+    action: Literal["ignore", "react", "reply", "message", "poll"]
+    text: Optional[str] = None
+    emoji: Optional[str] = None
+    poll_data: Optional[dict[str, Any]] = None
+    reasoning: str = ""
+    persona_name: str = ""
+    model_used: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
+    retrieved_context_meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxProactiveRequest(BaseModel):
+    mode: Literal["auto", "revive", "new_topic"] = "auto"
+    silence_hours_override: Optional[float] = Field(default=None, ge=0.0, le=720.0)
+    sandbox_messages: list[SandboxChatMessage] = Field(default_factory=list, max_length=50)
+    include_real_history: bool = True
+
+
+class SandboxProactiveResponse(BaseModel):
+    text: str
+    new_topic_mode: bool
+    silence_hours: float
+    persona_name: str = ""
+    gate_notes: list[str] = Field(default_factory=list)
+    model_used: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
+    retrieved_context_meta: dict[str, Any] = Field(default_factory=dict)
+

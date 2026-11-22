@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Brain,
   FileUp,
+  FlaskConical,
   MessageSquareText,
   Sliders,
   Trash2,
@@ -14,9 +15,10 @@ import { BehaviorPersonaTab } from './BehaviorPersonaTab';
 import { ContextEpisodesTab } from './ContextEpisodesTab';
 import { MembersDossierTab } from './MembersDossierTab';
 import { LiveChatThoughtsTab } from './LiveChatThoughtsTab';
+import { SandboxChatTab } from './SandboxChatTab';
 import { ImportHistoryTab } from './ImportHistoryTab';
 
-type TabKey = 'live' | 'members' | 'context' | 'behavior' | 'import';
+type TabKey = 'live' | 'sandbox' | 'members' | 'context' | 'behavior' | 'import';
 
 interface Props {
   groupId: number;
@@ -64,6 +66,7 @@ export function GroupDetailPage({ groupId, onBack }: Props) {
 
   const tabs: { key: TabKey; label: string; icon: React.ReactNode }[] = [
     { key: 'live', label: 'Живой чат и Мысли бота', icon: <MessageSquareText className="w-4 h-4" /> },
+    { key: 'sandbox', label: 'Песочница (Тест-чат)', icon: <FlaskConical className="w-4 h-4" /> },
     { key: 'members', label: 'Участники (Досье)', icon: <Users className="w-4 h-4" /> },
     { key: 'context', label: 'Контекст и Векторная память', icon: <Brain className="w-4 h-4" /> },
     { key: 'behavior', label: 'Персона и Поведение', icon: <Sliders className="w-4 h-4" /> },
@@ -138,6 +141,7 @@ export function GroupDetailPage({ groupId, onBack }: Props) {
 
       {/* Tab Content */}
       {activeTab === 'live' && <LiveChatThoughtsTab group={group} onRefreshGroup={reloadGroup} />}
+      {activeTab === 'sandbox' && <SandboxChatTab group={group} />}
       {activeTab === 'members' && <MembersDossierTab groupId={group.id} />}
       {activeTab === 'context' && (
         <ContextEpisodesTab

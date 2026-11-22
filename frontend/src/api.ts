@@ -16,6 +16,9 @@ import type {
   PersonaTemplate,
   PollPayload,
   PromptTemplateSpec,
+  SandboxChatMessage,
+  SandboxChatResponse,
+  SandboxProactiveResponse,
   SystemConfig,
 } from './types';
 
@@ -247,6 +250,27 @@ export const api = {
   forceProactive: (groupId: number) =>
     request<{ status: string; text?: string }>(`/api/groups/${groupId}/actions/trigger-proactive`, {
       method: 'POST',
+    }),
+  sandboxChat: (
+    groupId: number,
+    payload: { messages: SandboxChatMessage[]; include_real_history: boolean }
+  ) =>
+    request<SandboxChatResponse>(`/api/groups/${groupId}/sandbox/chat`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  sandboxProactive: (
+    groupId: number,
+    payload: {
+      mode: 'auto' | 'revive' | 'new_topic';
+      silence_hours_override?: number | null;
+      sandbox_messages?: SandboxChatMessage[];
+      include_real_history: boolean;
+    }
+  ) =>
+    request<SandboxProactiveResponse>(`/api/groups/${groupId}/sandbox/proactive`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }),
   importTelegramHistory: (groupId: number, files: File[], triggerAnalysis: boolean) => {
     const fd = new FormData();
