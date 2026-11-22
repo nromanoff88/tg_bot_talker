@@ -15,6 +15,7 @@ import type {
   PersonaOverride,
   PersonaTemplate,
   PollPayload,
+  PromptTemplateSpec,
   SystemConfig,
 } from './types';
 
@@ -101,6 +102,19 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   deletePersona: (id: string) => request(`/api/personas/${id}`, { method: 'DELETE' }),
+
+  // Prompt Templates (Jinja2)
+  getPromptTemplates: () => request<PromptTemplateSpec[]>('/api/settings/prompts'),
+  updatePromptTemplates: (templates: Record<string, string>) =>
+    request<PromptTemplateSpec[]>('/api/settings/prompts', {
+      method: 'PUT',
+      body: JSON.stringify({ templates }),
+    }),
+  previewPromptTemplate: (key: string, template: string, group_id?: number | null) =>
+    request<{ rendered: string }>('/api/settings/prompts/preview', {
+      method: 'POST',
+      body: JSON.stringify({ key, template, group_id: group_id ?? null }),
+    }),
 
   // Groups
   listGroups: () => request<GroupSummary[]>('/api/groups'),

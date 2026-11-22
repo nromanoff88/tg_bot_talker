@@ -40,6 +40,12 @@ async def init_db() -> None:
                 "ADD COLUMN IF NOT EXISTS new_topic_after_hours DOUBLE PRECISION DEFAULT 4.0"
             )
         )
+        await conn.execute(
+            text(
+                "ALTER TABLE system_config "
+                "ADD COLUMN IF NOT EXISTS prompt_templates JSONB DEFAULT '{}'::jsonb"
+            )
+        )
 
     async with AsyncSessionLocal() as session:
         # 1. Инициализация глобальной конфигурации LLM (и синхронизация с .env, если в БД остались пустые/дефолтные поля)

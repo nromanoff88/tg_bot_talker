@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.auth import require_admin
 from app.database import get_db
@@ -22,10 +23,30 @@ from app.schemas import (
     PersonaTemplateCreate,
     PersonaTemplateOut,
     PersonaTemplateUpdate,
+    PromptPreviewRequest,
+    PromptPreviewResponse,
+    PromptTemplateSpecOut,
+    PromptTemplatesUpdateRequest,
+    PromptVariableDoc,
     SystemConfigResponse,
     SystemConfigUpdate,
 )
 from app.services.llm_service import invalidate_llm_config_cache, test_llm_connectivity
+from app.services.memory_service import (
+    collect_persona_prompt_vars,
+    ensure_group_initialized,
+    format_current_datetime_context,
+    format_message_local_ts,
+    resolve_effective_persona,
+)
+from app.services.prompt_service import (
+    PROMPT_SPECS,
+    PROMPT_SPECS_BY_KEY,
+    get_prompt_overrides,
+    invalidate_prompt_templates_cache,
+    render_prompt,
+    validate_jinja2_template,
+)
 
 router = APIRouter(prefix="/api", tags=["settings"], dependencies=[Depends(require_admin)])
 
@@ -155,6 +176,215 @@ async def update_llm_settings(
 @router.post("/settings/llm/test")
 async def test_llm_settings(session: AsyncSession = Depends(get_db)) -> dict:
     return await test_llm_connectivity(session)
+
+
+def _serialize_prompt_specs(overrides: dict[str, str]) -> list[PromptTemplateSpecOut]:
+    out: list[PromptTemplateSpecOut] = []
+    for spec in PROMPT_SPECS:
+        custom = overrides.get(spec.key)
+        is_custom = bool(custom and custom.strip() and custom.strip() != spec.default_template.strip())
+        out.append(
+            PromptTemplateSpecOut(
+                key=spec.key,
+                title=spec.title,
+                description=spec.description,
+                template=custom if is_custom else spec.default_template,
+                default_template=spec.default_template,
+                is_custom=is_custom,
+                variables=[PromptVariableDoc(name=n, description=d) for n, d in spec.variables],
+            )
+        )
+    return out
+
+
+@router.get("/settings/prompts", response_model=list[PromptTemplateSpecOut])
+async def get_prompt_templates(session: AsyncSession = Depends(get_db)) -> list[PromptTemplateSpecOut]:
+    overrides = await get_prompt_overrides(session)
+    return _serialize_prompt_specs(overrides)
+
+
+@router.put("/settings/prompts", response_model=list[PromptTemplateSpecOut])
+async def update_prompt_templates(
+    payload: PromptTemplatesUpdateRequest,
+    session: AsyncSession = Depends(get_db),
+) -> list[PromptTemplateSpecOut]:
+    cfg = await session.get(SystemConfig, 1)
+    if not cfg:
+        cfg = SystemConfig(id=1)
+        session.add(cfg)
+
+    next_overrides: dict[str, str] = dict(cfg.prompt_templates or {})
+    for key, raw_val in payload.templates.items():
+        spec = PROMPT_SPECS_BY_KEY.get(key)
+        if not spec:
+            raise HTTPException(status_code=400, detail=f"Неизвестный ключ шаблона: {key}")
+
+        cleaned = (raw_val or "").strip()
+        if not cleaned or cleaned == spec.default_template.strip():
+            next_overrides.pop(key, None)
+            continue
+
+        try:
+            validate_jinja2_template(cleaned)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"{spec.title}: {exc}") from exc
+
+        next_overrides[key] = cleaned
+
+    cfg.prompt_templates = next_overrides
+    await session.commit()
+    invalidate_prompt_templates_cache()
+    overrides = await get_prompt_overrides(session)
+    return _serialize_prompt_specs(overrides)
+
+
+@router.post("/settings/prompts/preview", response_model=PromptPreviewResponse)
+async def preview_prompt_template(
+    payload: PromptPreviewRequest,
+    session: AsyncSession = Depends(get_db),
+) -> PromptPreviewResponse:
+    if payload.key not in PROMPT_SPECS_BY_KEY:
+        raise HTTPException(status_code=400, detail=f"Неизвестный ключ шаблона: {payload.key}")
+
+    try:
+        validate_jinja2_template(payload.template)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    group: Group | None = None
+    if payload.group_id is not None:
+        group = await ensure_group_initialized(session, payload.group_id)
+    else:
+        first_group_id = (
+            await session.execute(select(Group.id).order_by(Group.is_active.desc(), Group.last_message_at.desc().nullslast()).limit(1))
+        ).scalar_one_or_none()
+        if first_group_id is not None:
+            group = await ensure_group_initialized(session, int(first_group_id))
+
+    if group is not None:
+        recent_msgs = list(
+            reversed(
+                (
+                    await session.execute(
+                        select(Message)
+                        .where(Message.group_id == group.id)
+                        .order_by(Message.created_at.desc())
+                        .limit(12)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        )
+        sample_eps = [
+            (ep, 0.85)
+            for ep in (
+                await session.execute(
+                    select(MemoryEpisode)
+                    .where(MemoryEpisode.group_id == group.id)
+                    .order_by(MemoryEpisode.happened_at.desc())
+                    .limit(4)
+                )
+            )
+            .scalars()
+            .all()
+        ]
+        prompt_vars, _ = await collect_persona_prompt_vars(session, group, recent_msgs, sample_eps)
+        tz_name = group.settings.timezone if group.settings else "Europe/Moscow"
+        now_str = prompt_vars["current_datetime"]
+        persona = prompt_vars["persona"]
+        chat_lines = [
+            f"#{m.telegram_message_id} [{format_message_local_ts(m.created_at, tz_name)}] "
+            f"{persona['display_name'] + ' (ТЫ)' if m.is_from_bot else m.sender_name}: {m.text_content}"
+            for m in recent_msgs
+        ]
+        top_members = list(
+            (
+                await session.execute(
+                    select(GroupMember)
+                    .options(selectinload(GroupMember.facts))
+                    .where(GroupMember.group_id == group.id)
+                    .order_by(GroupMember.message_count.desc())
+                    .limit(5)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        member_hooks = [
+            f"- {m.display_name}: {m.character_summary} | Факты: {'; '.join(f.fact_text for f in m.facts[:4])}"
+            for m in top_members
+            if m.character_summary or m.facts
+        ]
+        brief_authors = "\n".join(
+            f"- {m.display_name}: {m.character_summary[:140] or 'участник чата'}" for m in top_members
+        )
+        last_msg_id = recent_msgs[-1].telegram_message_id if recent_msgs else 101
+        ctx: dict = {
+            **prompt_vars,
+            "chat_history": "\n".join(chat_lines) or "#101 [12:00] Участник: Привет чат!",
+            "chat_messages": "\n".join(chat_lines) or "#101 [12:00] Участник: Привет чат!",
+            "reasoning": "Пример: к боту обратились или в чате обсуждают близкую тему.",
+            "action": "reply",
+            "target_msg_id": last_msg_id,
+            "reply_instruction": f"Напиши естественный живой ответ реплаем на сообщение #{last_msg_id}.",
+            "chattiness_level": group.settings.chattiness_level if group.settings else 0.35,
+            "is_direct_ping": True,
+            "reactions_enabled": group.settings.reactions_enabled if group.settings else True,
+            "allowed_emojis": group.settings.allowed_emojis if group.settings else ["👍", "🔥"],
+            "brief_authors": brief_authors or "нет данных",
+            "silence_hours": "4.5",
+            "silence_minutes": "45",
+            "recent_preview": "\n".join(chat_lines[-5:]) or "Чат пока пуст.",
+            "member_hooks": "\n".join(member_hooks) or "Пока мало фактов об участниках.",
+        }
+        _ = resolve_effective_persona  # ensure import used cleanly if needed
+    else:
+        now_str = format_current_datetime_context("Europe/Moscow")
+        ctx = {
+            "group_title": "Тестовый чат",
+            "group_id": -100123456789,
+            "current_datetime": now_str,
+            "persona": {
+                "display_name": "Макс",
+                "backstory": "Обычный живой участник чата.",
+                "communication_style": "Пиши коротко и живо.",
+                "taboos": "Никаких фраз «Как ИИ».",
+                "example_phrases": ["звучит как план!"],
+            },
+            "examples_block": "- «звучит как план!»",
+            "group_summary": "Обычный живой групповой чат друзей.",
+            "active_topics": ["планы на выходные"],
+            "active_topics_str": "планы на выходные",
+            "jokes_and_rules": [],
+            "jokes_block": "- пока не зафиксированы",
+            "members": [],
+            "members_block": "Пока мало данных об участниках.",
+            "episodes": [],
+            "episodes_block": "Нет специфичных старых эпизодов.",
+            "chat_history": "#1 [18:00] Никита: Всем привет!",
+            "chat_messages": "#1 [18:00] Никита: Всем привет!",
+            "reasoning": "Пример мотивации роутера.",
+            "action": "reply",
+            "target_msg_id": 1,
+            "reply_instruction": "Напиши естественный живой ответ реплаем на сообщение #1.",
+            "chattiness_level": 0.35,
+            "is_direct_ping": True,
+            "reactions_enabled": True,
+            "allowed_emojis": ["👍", "🔥"],
+            "brief_authors": "- Никита: участник чата",
+            "silence_hours": "5.0",
+            "silence_minutes": "60",
+            "recent_preview": "Никита: Всем привет!",
+            "member_hooks": "- Никита: любит лыжи",
+        }
+
+    try:
+        rendered = await render_prompt(session, payload.key, ctx, custom_template=payload.template)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Ошибка рендера Jinja2: {exc}") from exc
+
+    return PromptPreviewResponse(rendered=rendered)
 
 
 # ==========================================

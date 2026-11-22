@@ -47,6 +47,8 @@ class SystemConfig(Base):
     bot_display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     bot_last_heartbeat: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    prompt_templates: Mapped[dict[str, str]] = mapped_column(JSONB, default=dict)
+
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

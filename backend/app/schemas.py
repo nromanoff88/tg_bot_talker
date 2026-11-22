@@ -53,6 +53,35 @@ class SystemConfigUpdate(BaseModel):
     embedding_model: str
 
 
+class PromptVariableDoc(BaseModel):
+    name: str
+    description: str
+
+
+class PromptTemplateSpecOut(BaseModel):
+    key: str
+    title: str
+    description: str
+    template: str
+    default_template: str
+    is_custom: bool
+    variables: list[PromptVariableDoc]
+
+
+class PromptTemplatesUpdateRequest(BaseModel):
+    templates: dict[str, str]
+
+
+class PromptPreviewRequest(BaseModel):
+    key: str
+    template: str
+    group_id: Optional[int] = None
+
+
+class PromptPreviewResponse(BaseModel):
+    rendered: str
+
+
 class DashboardStatsResponse(BaseModel):
     total_groups: int
     active_groups: int

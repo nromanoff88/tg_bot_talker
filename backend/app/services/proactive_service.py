@@ -18,6 +18,7 @@ from app.services.memory_service import (
     format_message_local_ts,
     resolve_effective_persona,
 )
+from app.services.prompt_service import render_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -79,32 +80,19 @@ async def generate_and_send_proactive_message(
         for m in recent_msgs[-8:]
     )
 
-    if start_new_topic:
-        user_prompt = (
-            f"ТЕКУЩЕЕ МЕСТНОЕ ВРЕМЯ: {now_str}\n"
-            f"В чате «{group.title}» тишина уже более {silence_hours:.1f} ч. "
-            f"Предыдущий разговор давно закончился, и ты решил сам закинуть в чат НОВУЮ тему.\n\n"
-            f"О ЧЁМ ГОВОРИЛИ В ПРОШЛЫЙ РАЗ (ТОЛЬКО ДЛЯ СПРАВКИ, ЧТОБЫ НЕ ПОВТОРЯТЬСЯ):\n"
-            f"{recent_preview or 'Чат пока пуст.'}\n\n"
-            f"ДОСЬЕ И ИНТЕРЕСЫ УЧАСТНИКОВ ГРУППЫ:\n"
-            f"{chr(10).join(member_hooks) or 'Пока мало фактов об участниках.'}\n\n"
-            f"СТРОГОЕ ПРАВИЛО: НЕ продолжай и НЕ комментируй старую тему из прошлых сообщений выше — тот разговор уже закрыт!\n"
-            f"ЗАДАЧА: Напиши ОДНО короткое живое сообщение (1–2 предложения) на СОВЕРШЕННО НОВУЮ тему в своём характере. "
-            f"Можешь: вбросить свежий жизненный вопрос/историю/наблюдение по интересам тусовки, "
-            f"или обратиться к кому-то из участников по факту из его досье (не связанному с последним диалогом). "
-            f"Пиши естественно, без штампов вроде «Всем привет! Как дела? Давайте сменим тему»."
-        )
-    else:
-        user_prompt = (
-            f"ТЕКУЩЕЕ МЕСТНОЕ ВРЕМЯ: {now_str}\n"
-            f"В чате «{group.title}» небольшая пауза ({silence_hours * 60:.0f} мин). "
-            f"Ты решил сам непринуждённо написать в чат и поддержать или оживить разговор.\n\n"
-            f"ЧТО НЕДАВНО ПИСАЛИ В ЧАТЕ:\n{recent_preview or 'Чат пока почти пуст.'}\n\n"
-            f"ЗАЦЕПКИ ПО УЧАСТНИКАМ ГРУППЫ:\n{chr(10).join(member_hooks) or 'Пока мало фактов об участниках.'}\n\n"
-            f"ЗАДАЧА: Напиши ОДНО короткое живое сообщение (1–2 предложения), чтобы естественно оживить чат. "
-            f"Варианты: развить недавнюю мысль/историю под новым углом, поинтересоваться у кого-то из ребят деталями, "
-            f"или поделиться короткой мыслью в своём характере. Без банального «Всем привет! Как дела?»."
-        )
+    prompt_key = "proactive_new_topic_prompt" if start_new_topic else "proactive_revive_prompt"
+    user_prompt = await render_prompt(
+        session,
+        prompt_key,
+        {
+            "current_datetime": now_str,
+            "group_title": group.title,
+            "silence_hours": f"{silence_hours:.1f}",
+            "silence_minutes": f"{silence_hours * 60:.0f}",
+            "recent_preview": recent_preview or ("Чат пока пуст." if start_new_topic else "Чат пока почти пуст."),
+            "member_hooks": "\n".join(member_hooks) or "Пока мало фактов об участниках.",
+        },
+    )
 
     text_out, usage = await complete_text(
         session=session,

@@ -19,6 +19,7 @@ from app.services.memory_service import (
     format_message_local_ts,
     resolve_effective_persona,
 )
+from app.services.prompt_service import render_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -236,29 +237,6 @@ async def generate_poll_via_llm(
     return sanitized, context_meta, usage
 
 
-ROUTER_SYSTEM_PROMPT = """Ты — внутренний фильтр социальной уместности живого участника группового чата Telegram.
-Твоя задача — посмотреть на последние сообщения в чате и решить, как поведёт себя живой человек с заданной личностью:
-1. "ignore" — промолчать (если люди обсуждают что-то узко личное между собой, короткие реплики «ок/спасибо/+», тема совсем чужая или твоё вмешательство будет выглядеть навязчиво).
-2. "react" — просто поставить эмодзи-реакцию на конкретное сообщение (когда шутка смешная, новость классная или хочется поддержать без лишних слов).
-3. "reply" — ответить реплаем на конкретное сообщение (когда обратились к тебе, задали интересный вопрос, пошла близкая тебе тема или уместно вставить живой комментарий).
-4. "message" — написать в общий поток без привязки к одному сообщению (когда комментируешь сразу весь диалог нескольких людей).
-5. "poll" — создать нативный опрос или викторину в Telegram (выбирай, когда участники просят сделать опрос/голосование/викторину или когда в живом споре/выборе планов действительно уместно запустить голосование в чате).
-
-Учитывай параметр `chattiness_level` (от 0.0 — почти всегда молчит, до 1.0 — очень разговорчивый душа компании).
-Если `is_direct_ping = true` (тебя упомянули или ответили на твоё сообщение), почти всегда выбирай "reply" (или "poll", если прямо просят создать опрос/голосование/викторину).
-Если в чате спрашивают о прошлых событиях по времени или дню («вчера», «в пятницу», «на прошлой неделе»), установи `need_memory_search = true` и подставь в `memory_query` конкретную дату и день недели, опираясь на текущую дату.
-
-Верни СТРОГО JSON:
-{
-  "action": "ignore | react | reply | message | poll",
-  "target_tg_msg_id": 12345,
-  "emoji": "🔥",
-  "need_memory_search": false,
-  "memory_query": "поисковый запрос для вспоминания старых обсуждений чата, если нужно",
-  "reasoning": "короткое объяснение на русском (1-2 предложения), почему принято именно такое решение"
-}"""
-
-
 async def evaluate_group_batch_and_decide(
     session: AsyncSession,
     group_id: int,
@@ -406,23 +384,31 @@ async def evaluate_group_batch_and_decide(
         ts = format_message_local_ts(m.created_at, g_settings.timezone)
         chat_lines.append(f"#{m.telegram_message_id}{new_tag} [{ts}] {who}{r_tag}: {m.text_content}")
 
-    router_user_prompt = (
-        f"ГРУППА: {group.title}\n"
-        f"ТЕКУЩЕЕ МЕСТНОЕ ВРЕМЯ ГРУППЫ: {now_str}\n"
-        f"ТВОЯ РОЛЬ: {persona['display_name']} — {persona['backstory'][:280]}\n"
-        f"ПАРАМЕТРЫ ПОВЕДЕНИЯ:\n"
-        f"- chattiness_level: {effective_chattiness}\n"
-        f"- is_direct_ping (обратились ли лично к тебе): {is_direct_ping and g_settings.reply_on_mention}\n"
-        f"- reactions_enabled: {g_settings.reactions_enabled}\n"
-        f"- allowed_emojis: {g_settings.allowed_emojis}\n\n"
-        f"КРАТКО О СОБЕСЕДНИКАХ:\n{chr(10).join(brief_authors) or 'нет данных'}\n\n"
-        f"ПОСЛЕДНИЕ СООБЩЕНИЯ ЧАТА:\n" + "\n".join(chat_lines)
+    router_sys_prompt = await render_prompt(
+        session,
+        "router_system_prompt",
+        {"group_title": group.title, "current_datetime": now_str},
+    )
+    router_user_prompt = await render_prompt(
+        session,
+        "router_user_prompt",
+        {
+            "group_title": group.title,
+            "current_datetime": now_str,
+            "persona": persona,
+            "chattiness_level": effective_chattiness,
+            "is_direct_ping": is_direct_ping and g_settings.reply_on_mention,
+            "reactions_enabled": g_settings.reactions_enabled,
+            "allowed_emojis": g_settings.allowed_emojis,
+            "brief_authors": "\n".join(brief_authors) or "нет данных",
+            "chat_messages": "\n".join(chat_lines),
+        },
     )
 
     router_json, router_usage = await complete_json(
         session=session,
         tier="fast",
-        system_prompt=ROUTER_SYSTEM_PROMPT,
+        system_prompt=router_sys_prompt,
         user_prompt=router_user_prompt,
         temperature=0.35,
         max_tokens=450,
@@ -446,7 +432,7 @@ async def evaluate_group_batch_and_decide(
         reasoning += " (Реакции отключены в настройках группы)."
 
     router_prompts = {
-        "router_system_prompt": ROUTER_SYSTEM_PROMPT,
+        "router_system_prompt": router_sys_prompt,
         "router_user_prompt": router_user_prompt,
     }
 
@@ -551,11 +537,17 @@ async def evaluate_group_batch_and_decide(
         else "Напиши естественную реплику в общий разговор чата."
     )
 
-    gen_user_prompt = (
-        f"ИСТОРИЯ ПОСЛЕДНИХ СООБЩЕНИЙ В ЧАТЕ:\n"
-        + "\n".join(full_chat_lines)
-        + f"\n\nТВОЯ ВНУТРЕННЯЯ МОТИВАЦИЯ СЕЙЧАС: {reasoning}\n"
-        + f"ЗАДАЧА: {reply_instruction}"
+    gen_user_prompt = await render_prompt(
+        session,
+        "reply_user_prompt",
+        {
+            "chat_history": "\n".join(full_chat_lines),
+            "reasoning": reasoning,
+            "reply_instruction": reply_instruction,
+            "action": raw_action,
+            "target_msg_id": target_msg_id,
+            "current_datetime": now_str,
+        },
     )
     context_meta["llm_prompts"] = {
         **router_prompts,

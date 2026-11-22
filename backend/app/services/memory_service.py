@@ -21,6 +21,7 @@ from app.models import (
 )
 from app.redis_client import get_redis, publish_group_event
 from app.services.llm_service import complete_json, create_embedding
+from app.services.prompt_service import render_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -277,19 +278,13 @@ async def search_relevant_episodes(
     return [(ep, 0.5) for ep in eps]
 
 
-async def build_persona_generation_context(
+async def collect_persona_prompt_vars(
     session: AsyncSession,
     group: Group,
     recent_messages: list[Message],
-    memory_query: str = "",
-) -> tuple[str, dict[str, Any]]:
-    """
-    Формирует системный промпт для Smart LLM со всеми 3 слоями памяти конкретной группы:
-    1) Персона и контекст группы
-    2) Досье участников недавнего обсуждения (с приоритетом закреплённых фактов и заметок админа)
-    3) Релевантные эпизоды из pgvector
-    Возвращает (system_prompt, retrieved_context_meta для лога мыслей).
-    """
+    episodes_with_sim: list[tuple[MemoryEpisode, float]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Собирает структурированные переменные и текстовые блоки для Jinja2-шаблонов Персоны."""
     persona = await resolve_effective_persona(session, group)
     ctx = group.context or await session.get(GroupContext, group.id)
 
@@ -303,19 +298,26 @@ async def build_persona_generation_context(
         )
         members = list((await session.execute(stmt)).scalars().all())
 
-    episodes_with_sim = await search_relevant_episodes(session, group.id, memory_query, top_k=4)
-
-    # Сборка секций системного промпта
-    jokes_lines = []
+    jokes_lines: list[str] = []
+    jokes_list: list[dict[str, Any]] = []
     if ctx and ctx.inside_jokes_and_rules:
         for item in ctx.inside_jokes_and_rules[:15]:
-            kind_label = {"meme": "Локальный мем", "rule": "Правило чата", "norm": "Традиция"}.get(
-                item.get("kind", "meme"), "Деталь"
+            kind = item.get("kind", "meme")
+            kind_label = {"meme": "Локальный мем", "rule": "Правило чата", "norm": "Традиция"}.get(kind, "Деталь")
+            txt = item.get("text", "")
+            jokes_lines.append(f"- [{kind_label}] {txt}")
+            jokes_list.append(
+                {
+                    "kind": kind,
+                    "kind_label": kind_label,
+                    "text": txt,
+                    "is_locked": bool(item.get("is_locked", False)),
+                }
             )
-            jokes_lines.append(f"- [{kind_label}] {item.get('text', '')}")
 
-    member_blocks = []
-    used_facts_meta = []
+    member_blocks: list[str] = []
+    members_list: list[dict[str, Any]] = []
+    used_facts_meta: list[dict[str, Any]] = []
     for m in members:
         sorted_facts = sorted(
             m.facts,
@@ -345,110 +347,94 @@ async def build_persona_generation_context(
             lines.append("  Известные факты:\n    " + "\n    ".join(fact_strs))
         member_blocks.append("\n".join(lines))
 
+        members_list.append(
+            {
+                "display_name": m.display_name,
+                "chat_nickname": m.chat_nickname or "",
+                "username": m.username or "",
+                "character_summary": m.character_summary or "",
+                "bot_attitude": m.bot_attitude or "",
+                "admin_notes": m.admin_notes or "",
+                "facts": [f.fact_text for f in sorted_facts],
+            }
+        )
+
     tz_name = group.settings.timezone if group.settings else "Europe/Moscow"
     now_str = format_current_datetime_context(tz_name)
 
-    episode_lines = []
-    used_episodes_meta = []
+    episode_lines: list[str] = []
+    episodes_list: list[dict[str, Any]] = []
+    used_episodes_meta: list[dict[str, Any]] = []
     for ep, sim in episodes_with_sim:
         date_str = format_episode_temporal_label(ep.happened_at, tz_name)
         episode_lines.append(f"- [{date_str}] {ep.title}: {ep.episode_summary}")
+        episodes_list.append(
+            {
+                "title": ep.title,
+                "summary": ep.episode_summary,
+                "date_label": date_str,
+                "similarity": sim,
+            }
+        )
         used_episodes_meta.append({"id": str(ep.id), "title": ep.title, "similarity": sim})
 
     examples_block = "\n".join(f"- «{ex}»" for ex in persona.get("example_phrases", [])[:6])
+    active_topics = list(ctx.active_topics) if ctx and ctx.active_topics else []
 
-    system_prompt = f"""Ты — живой участник группового чата «{group.title}» в Telegram.
-Твоё имя/ник в общении: {persona['display_name']}.
-
-ТЕКУЩАЯ ДАТА И МЕСТНОЕ ВРЕМЯ В ЧАТЕ:
-{now_str}
-
-ТВОЯ ЛИЧНОСТЬ И ЛЕГЕНДА:
-{persona['backstory']}
-
-ТВОЯ МАНЕРА ОБЩЕНИЯ:
-{persona['communication_style']}
-
-СТРОГИЕ ТАБУ (ЧЕГО ДЕЛАТЬ НЕЛЬЗЯ):
-{persona['taboos']}
-- Никогда не пиши как ассистент поддержки, не предлагай «помочь разобраться» и не ставь нумерованные/маркированные списки.
-- Не начинай ответ с имени собеседника и запятой в каждом сообщении, если и так делаешь реплай.
-- Отвечай только текстом самого сообщения (без кавычек вокруг ответа и без префикса со своим именем).
-- Не зацикливайся на одних и тех же старых шутках или присказках (не повторяй в каждом сообщении счётчик «чайников», «баранов», «Приору» или одну и ту же шутку, если собеседник сам про это не заговорил). Отвечай живым языком по сути текущей темы.
-
-ПРИМЕРЫ ТВОЕЙ ЖИВОЙ РЕЧИ:
-{examples_block or '- общайся коротко, метко и по-человечески'}
-
-КОНТЕКСТ И АТМОСФЕРА ЭТОЙ ГРУППЫ:
-Описание чата: {ctx.summary if ctx and ctx.summary else 'Обычный живой групповой чат.'}
-Активные темы: {', '.join(ctx.active_topics) if ctx and ctx.active_topics else 'разные повседневные темы'}
-Внутренние мемы, сленг и правила чата:
-{chr(10).join(jokes_lines) if jokes_lines else '- пока не зафиксированы'}
-
-ЧТО ТЫ ЗНАЕШЬ О ТЕКУЩИХ СОБЕСЕДНИКАХ В ЭТОЙ ГРУППЕ:
-{chr(10).join(member_blocks) if member_blocks else 'Пока мало данных об участниках — присматривайся и общайся естественно.'}
-
-ВОСПОМИНАНИЯ О ПРОШЛЫХ ОБСУЖДЕНИЯХ В ЭТОМ ЧАТЕ:
-{chr(10).join(episode_lines) if episode_lines else 'Нет специфичных старых эпизодов по этой теме.'}
-"""
+    prompt_vars: dict[str, Any] = {
+        "group_title": group.title,
+        "group_id": group.id,
+        "current_datetime": now_str,
+        "persona": persona,
+        "examples_block": examples_block or "- общайся коротко, метко и по-человечески",
+        "group_summary": ctx.summary if ctx and ctx.summary else "Обычный живой групповой чат.",
+        "active_topics": active_topics,
+        "active_topics_str": ", ".join(active_topics) if active_topics else "разные повседневные темы",
+        "jokes_and_rules": jokes_list,
+        "jokes_block": "\n".join(jokes_lines) if jokes_lines else "- пока не зафиксированы",
+        "members": members_list,
+        "members_block": (
+            "\n".join(member_blocks)
+            if member_blocks
+            else "Пока мало данных об участниках — присматривайся и общайся естественно."
+        ),
+        "episodes": episodes_list,
+        "episodes_block": (
+            "\n".join(episode_lines)
+            if episode_lines
+            else "Нет специфичных старых эпизодов по этой теме."
+        ),
+    }
 
     meta = {
         "persona_name": persona["display_name"],
         "current_local_time": now_str,
-        "memory_query": memory_query,
+        "memory_query": "",
         "members_loaded": [m.display_name for m in members],
         "facts_used": used_facts_meta[:15],
         "episodes_used": used_episodes_meta,
     }
+    return prompt_vars, meta
+
+
+async def build_persona_generation_context(
+    session: AsyncSession,
+    group: Group,
+    recent_messages: list[Message],
+    memory_query: str = "",
+) -> tuple[str, dict[str, Any]]:
+    """
+    Формирует системный промпт для Smart LLM со всеми 3 слоями памяти конкретной группы:
+    1) Персона и контекст группы
+    2) Досье участников недавнего обсуждения (с приоритетом закреплённых фактов и заметок админа)
+    3) Релевантные эпизоды из pgvector
+    Возвращает (system_prompt, retrieved_context_meta для лога мыслей).
+    """
+    episodes_with_sim = await search_relevant_episodes(session, group.id, memory_query, top_k=4)
+    prompt_vars, meta = await collect_persona_prompt_vars(session, group, recent_messages, episodes_with_sim)
+    meta["memory_query"] = memory_query
+    system_prompt = await render_prompt(session, "persona_system_prompt", prompt_vars)
     return system_prompt, meta
-
-
-MEMORY_EXTRACTION_SYSTEM_PROMPT = """Ты — аналитик социальной динамики и памяти группового чата.
-Твоя задача — внимательно прочитать очередную пачку сообщений группы и обновить:
-1) Общее саммари группы, внутренние мемы/правила и текущие активные темы.
-2) Психологический портрет, манеру речи, как человека зовут в чате, отношение бота к нему и конкретные атомарные факты по каждому участнику.
-3) Запомнить 0, 1 или 2 ярких смысловых эпизода (только если в пачке было содержательное обсуждение, история, спор или событие, которое стоит помнить спустя недели; пустой трёп в эпизоды не записывай).
-
-КРИТИЧЕСКИЕ ПРАВИЛА:
-- Все пометки [LOCKED BY ADMIN] являются абсолютной истиной: НЕ дублируй их и НЕ пытайся их опровергнуть.
-- В new_facts участников записывай ТОЛЬКО долгосрочные реальные факты о самом человеке (работа, профессия, семья, отношения, хобби, техника/машина, город, реальные привычки, вкусы и взгляды). Если в пачке нет таких новых фактов о человеке — верни "new_facts": [].
-- КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО записывать в new_facts участников:
-  • выдумки, ролевые шутки и фантазии самого [БОТ] (например: «должен боту 5 чайников и 3 барана», «тонированная Приора бота» и т.п.);
-  • одноразовые ситуативные реплики, пинги, тестовые команды и ругань/подколы в адрес бота (например: «обозвал бота», «спросил у бота сколько градусов», «велел боту молчать», «урезал болтливость до 5%», «тестирует бота»).
-- В new_jokes_or_rules КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО записывать собственные повторяющиеся присказки [БОТ] («новое слово за сессию = чайник», «баран с Егора», однотипные шутки бота про себя самого). Фиксируй только 0–1 реальный устойчивый мем или правило самих участников группы, если такой действительно появился в пачке.
-- Не выдумывай то, чего не было, и пиши всё лаконично на русском языке.
-
-Верни строго валидный JSON следующего формата:
-{
-  "group_summary_update": "обновлённое краткое описание атмосферы и тематики группы (2-4 предложения) или пустая строка, если менять не нужно",
-  "active_topics": ["тема 1", "тема 2"],
-  "new_jokes_or_rules": [
-    {"kind": "meme", "text": "описание реальной локальной шутки, сленга или правила участников (или пустой массив [])"}
-  ],
-  "member_updates": [
-    {
-      "member_id": "UUID участника из входных данных",
-      "chat_nickname": "как к нему обращаются в чате (или пустая строка)",
-      "character_summary": "обновлённый портрет характера, темперамента и манеры общения (1-3 предложения)",
-      "bot_attitude": "естественное отношение бота к этому человеку (например: свой парень, интересно спорить про технику, стоит общаться бережно)",
-      "new_facts": [
-        {
-          "category": "work | hobby | bio | opinion | style | relationship | other",
-          "fact_text": "конкретный долгосрочный реальный факт об участнике",
-          "confidence": 0.9,
-          "source_message_id": 12345
-        }
-      ]
-    }
-  ],
-  "new_episodes": [
-    {
-      "title": "Короткий заголовок обсуждения/события",
-      "episode_summary": "Ёмкая выжимка в 2-4 предложениях: кто что рассказал/обсуждал и к чему пришли",
-      "participant_names": ["Имя 1", "Имя 2"]
-    }
-  ]
-}"""
 
 
 async def analyze_group_memory_batch(
@@ -543,10 +529,15 @@ async def analyze_group_memory_batch(
             f"НОВЫЕ СООБЩЕНИЯ ДЛЯ АНАЛИЗА ({len(batch_msgs)} шт.):\n" + "\n".join(transcript_lines)
         )
 
+        extract_sys_prompt = await render_prompt(
+            session,
+            "memory_extraction_system_prompt",
+            {"group_title": group.title},
+        )
         extracted, usage = await complete_json(
             session=session,
             tier="fast",
-            system_prompt=MEMORY_EXTRACTION_SYSTEM_PROMPT,
+            system_prompt=extract_sys_prompt,
             user_prompt=user_prompt,
             temperature=0.2,
             max_tokens=4500,
@@ -704,7 +695,7 @@ async def analyze_group_memory_batch(
             retrieved_context_meta={
                 "remaining_unanalyzed": int(remaining),
                 "llm_prompts": {
-                    "fast_system_prompt": MEMORY_EXTRACTION_SYSTEM_PROMPT,
+                    "fast_system_prompt": extract_sys_prompt,
                     "fast_user_prompt": user_prompt,
                 },
             },

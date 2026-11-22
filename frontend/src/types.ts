@@ -227,3 +227,18 @@ export interface GeneratePollRequest {
   allows_multiple_answers: boolean;
 }
 
+export interface PromptVariableDoc {
+  name: string;
+  description: string;
+}
+
+export interface PromptTemplateSpec {
+  key: string;
+  title: string;
+  description: string;
+  template: string;
+  default_template: string;
+  is_custom: boolean;
+  variables: PromptVariableDoc[];
+}
+
