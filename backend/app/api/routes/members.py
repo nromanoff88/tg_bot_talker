@@ -184,8 +184,10 @@ async def merge_group_members(
                 existing.is_pinned = True
             if sf.confidence > existing.confidence:
                 existing.confidence = sf.confidence
+            source.facts.remove(sf)
             await session.delete(sf)
         else:
+            sf.member = target
             sf.member_id = target.id
             target_facts_by_norm[norm_txt] = sf
 
@@ -224,7 +226,8 @@ async def merge_group_members(
     if target.telegram_user_id >= SYNTHETIC_TG_ID_BASE and source.telegram_user_id < SYNTHETIC_TG_ID_BASE:
         real_tg_id_to_adopt = source.telegram_user_id
 
-    # 4. Удаляем карточку-дубль и фиксируем освобождение уникального индекса (group_id, telegram_user_id)
+    # 4. Сначала фиксируем UPDATE фактов/сообщений и отсоединение от дубля, затем удаляем дубль
+    await session.flush()
     await session.delete(source)
     await session.flush()
 
