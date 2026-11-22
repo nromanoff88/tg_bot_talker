@@ -9,7 +9,12 @@ from sqlalchemy.orm import selectinload
 
 from app.models import DecisionLog, Group, GroupMember, GroupSettings, Message
 from app.redis_client import publish_bot_command, publish_group_event
-from app.services.decision_service import build_ephemeral_messages, humanize_bot_text, is_within_quiet_hours
+from app.services.decision_service import (
+    build_ephemeral_messages,
+    humanize_bot_text,
+    is_within_quiet_hours,
+    load_group_readonly,
+)
 from app.services.llm_service import LLMUsage, complete_text
 from app.services.memory_service import (
     build_persona_generation_context,
@@ -201,14 +206,7 @@ async def simulate_proactive_message(
     - НЕ пишет DecisionLog и НЕ отправляет сообщение в Telegram;
     - дополнительно возвращает диагностику gate_notes о готовности реального планировщика.
     """
-    stmt = (
-        select(Group)
-        .options(selectinload(Group.settings), selectinload(Group.context))
-        .where(Group.id == group_id)
-    )
-    group = (await session.execute(stmt)).scalars().first()
-    if not group:
-        raise ValueError("Группа не найдена")
+    group = await load_group_readonly(session, group_id)
 
     g_settings = group.settings or GroupSettings(group_id=group_id)
     persona = await resolve_effective_persona(session, group)

@@ -746,6 +746,23 @@ async def evaluate_group_batch_and_decide(
     )
 
 
+async def load_group_readonly(session: AsyncSession, group_id: int) -> Group:
+    """Загружает группу с настройками, контекстом и шаблоном персоны без создания новых записей."""
+    stmt = (
+        select(Group)
+        .options(
+            selectinload(Group.settings),
+            selectinload(Group.context),
+            selectinload(Group.persona_template),
+        )
+        .where(Group.id == group_id)
+    )
+    group = (await session.execute(stmt)).scalars().first()
+    if not group:
+        raise ValueError("Группа не найдена")
+    return group
+
+
 async def simulate_tagged_reply(
     session: AsyncSession,
     group_id: int,
@@ -757,14 +774,7 @@ async def simulate_tagged_reply(
     - читает текущую память группы, участников и настройки;
     - НЕ сохраняет сообщения, НЕ пишет DecisionLog и НЕ отправляет ничего в Telegram.
     """
-    stmt = (
-        select(Group)
-        .options(selectinload(Group.settings), selectinload(Group.context))
-        .where(Group.id == group_id)
-    )
-    group = (await session.execute(stmt)).scalars().first()
-    if not group:
-        raise ValueError("Группа не найдена")
+    group = await load_group_readonly(session, group_id)
 
     g_settings = group.settings or GroupSettings(group_id=group_id)
     persona = await resolve_effective_persona(session, group)
