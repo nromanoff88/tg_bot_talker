@@ -36,6 +36,9 @@ export function PersonasPage() {
   const [previewGroupId, setPreviewGroupId] = useState<string>('');
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewResult, setPreviewResult] = useState('');
+  const [variableValues, setVariableValues] = useState<Record<string, string>>({});
+  const [varsLoading, setVarsLoading] = useState(false);
+  const [showVarValues, setShowVarValues] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const loadPersonas = async () => {
@@ -64,6 +67,33 @@ export function PersonasPage() {
     loadPersonas();
     loadPromptsAndGroups();
   }, []);
+
+  useEffect(() => {
+    if (mode !== 'prompts' || specs.length === 0) return;
+    const spec = specs.find((s) => s.key === selectedKey);
+    if (!spec) return;
+
+    let cancelled = false;
+    setVarsLoading(true);
+    const gid = previewGroupId ? Number(previewGroupId) : null;
+    api
+      .previewPromptTemplate(spec.key, spec.default_template, gid)
+      .then((res) => {
+        if (!cancelled) {
+          setVariableValues(res.variable_values || {});
+        }
+      })
+      .catch(() => {
+        // ignore transient preview error
+      })
+      .finally(() => {
+        if (!cancelled) setVarsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, selectedKey, previewGroupId, specs]);
 
   const selectPersona = (p: PersonaTemplate) => {
     setSelectedId(p.id);
@@ -204,6 +234,7 @@ export function PersonasPage() {
       const gid = previewGroupId ? Number(previewGroupId) : null;
       const res = await api.previewPromptTemplate(selectedSpec.key, promptDraft, gid);
       setPreviewResult(res.rendered);
+      setVariableValues(res.variable_values || {});
     } catch (err: any) {
       setPromptError(err.message);
     } finally {
@@ -448,11 +479,39 @@ export function PersonasPage() {
                   <p className="text-xs text-slate-400 mt-1">{selectedSpec.description}</p>
                 </div>
 
-                {/* Доступные переменные Jinja2 */}
-                <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
-                  <div className="text-[11px] font-medium text-slate-300">
-                    Доступные переменные Jinja2 (клик вставит в шаблон):
+                {/* Доступные переменные Jinja2 и их текущие значения */}
+                <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-[11px] font-medium text-slate-300">
+                      Переменные Jinja2 и их реальные значения (клик по чипу вставит в шаблон):
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        value={previewGroupId}
+                        onChange={(e) => setPreviewGroupId(e.target.value)}
+                        className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-200"
+                      >
+                        {groups.length === 0 ? (
+                          <option value="">Демо-контекст</option>
+                        ) : (
+                          groups.map((g) => (
+                            <option key={g.id} value={String(g.id)}>
+                              Группа: {g.title}
+                            </option>
+                          ))
+                        )}
+                      </select>
+
+                      <button
+                        type="button"
+                        onClick={() => setShowVarValues((v) => !v)}
+                        className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[11px] text-sky-300 cursor-pointer"
+                      >
+                        {showVarValues ? 'Скрыть значения переменных' : 'Показать значения переменных'}
+                      </button>
+                    </div>
                   </div>
+
                   <div className="flex flex-wrap gap-1.5">
                     {selectedSpec.variables.map((v) => (
                       <button
@@ -466,18 +525,38 @@ export function PersonasPage() {
                       </button>
                     ))}
                   </div>
-                  <details className="text-[11px] text-slate-400 pt-1">
-                    <summary className="cursor-pointer hover:text-slate-200">
-                      Расшифровка всех переменных ({selectedSpec.variables.length})
-                    </summary>
-                    <div className="mt-1.5 space-y-1 pl-2 border-l border-slate-800">
-                      {selectedSpec.variables.map((v) => (
-                        <div key={v.name}>
-                          <code className="text-indigo-300">{`{{ ${v.name} }}`}</code> — {v.description}
-                        </div>
-                      ))}
+
+                  {showVarValues && (
+                    <div className="max-h-72 overflow-y-auto space-y-2 pt-2 border-t border-slate-800/80 pr-1">
+                      {varsLoading ? (
+                        <div className="text-[11px] text-slate-500">Загрузка значений переменных для выбранной группы...</div>
+                      ) : (
+                        selectedSpec.variables.map((v) => {
+                          const rawVal = variableValues[v.name] ?? '';
+                          return (
+                            <div
+                              key={v.name}
+                              className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 space-y-1"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                                <button
+                                  type="button"
+                                  onClick={() => insertVariableAtCursor(v.name)}
+                                  className="font-mono text-indigo-300 hover:text-indigo-200 cursor-pointer"
+                                >
+                                  {`{{ ${v.name} }}`}
+                                </button>
+                                <span className="text-slate-400">{v.description}</span>
+                              </div>
+                              <pre className="whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed bg-slate-950 border border-slate-800/80 rounded p-2 max-h-36 overflow-y-auto text-emerald-300/90">
+                                {rawVal || '(пусто)'}
+                              </pre>
+                            </div>
+                          );
+                        })
+                      )}
                     </div>
-                  </details>
+                  )}
                 </div>
 
                 {/* Поле редактирования шаблона */}

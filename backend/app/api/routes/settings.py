@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -384,7 +385,23 @@ async def preview_prompt_template(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Ошибка рендера Jinja2: {exc}") from exc
 
-    return PromptPreviewResponse(rendered=rendered)
+    spec = PROMPT_SPECS_BY_KEY[payload.key]
+    variable_values: dict[str, str] = {}
+    for var_name, _ in spec.variables:
+        val: object = ctx
+        for part in var_name.split("."):
+            if isinstance(val, dict):
+                val = val.get(part)
+            else:
+                val = getattr(val, part, None)
+        if val is None:
+            variable_values[var_name] = ""
+        elif isinstance(val, (dict, list)):
+            variable_values[var_name] = json.dumps(val, ensure_ascii=False, indent=2)
+        else:
+            variable_values[var_name] = str(val)
+
+    return PromptPreviewResponse(rendered=rendered, variable_values=variable_values)
 
 
 # ==========================================

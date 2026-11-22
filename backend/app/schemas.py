@@ -80,6 +80,7 @@ class PromptPreviewRequest(BaseModel):
 
 class PromptPreviewResponse(BaseModel):
     rendered: str
+    variable_values: dict[str, str] = Field(default_factory=dict)
 
 
 class DashboardStatsResponse(BaseModel):

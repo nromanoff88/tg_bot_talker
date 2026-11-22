@@ -111,7 +111,7 @@ export const api = {
       body: JSON.stringify({ templates }),
     }),
   previewPromptTemplate: (key: string, template: string, group_id?: number | null) =>
-    request<{ rendered: string }>('/api/settings/prompts/preview', {
+    request<{ rendered: string; variable_values: Record<string, string> }>('/api/settings/prompts/preview', {
       method: 'POST',
       body: JSON.stringify({ key, template, group_id: group_id ?? null }),
     }),
