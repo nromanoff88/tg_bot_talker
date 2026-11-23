@@ -175,13 +175,39 @@ class _TgChannelHTMLParser(HTMLParser):
                 self._in_text_depth = 0
 
 
+async def _get_json_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict[str, Any],
+    attempts: int = 3,
+) -> dict[str, Any]:
+    """Выполняет GET-запрос с короткими повторами при временных 429/5xx ответах внешнего API."""
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            resp = await client.get(url, params=params)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt + 1 < attempts:
+                await asyncio.sleep(0.8 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.TimeoutException as exc:
+            last_exc = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.8 * (attempt + 1))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Request failed for {url}")
+
+
 async def _fetch_single_city_weather(client: httpx.AsyncClient, city_name: str) -> str:
-    geo_resp = await client.get(
+    geo_data = await _get_json_with_retry(
+        client,
         "https://geocoding-api.open-meteo.com/v1/search",
         params={"name": city_name, "count": 1, "language": "ru", "format": "json"},
     )
-    geo_resp.raise_for_status()
-    geo_data = geo_resp.json()
     results = geo_data.get("results") or []
     if not results:
         raise ValueError(f"Город «{city_name}» не найден в Open-Meteo")
@@ -193,7 +219,8 @@ async def _fetch_single_city_weather(client: httpx.AsyncClient, city_name: str) 
     country = place.get("country") or ""
     title = f"{resolved_name} ({country})" if country else resolved_name
 
-    fc_resp = await client.get(
+    fc = await _get_json_with_retry(
+        client,
         "https://api.open-meteo.com/v1/forecast",
         params={
             "latitude": lat,
@@ -205,8 +232,6 @@ async def _fetch_single_city_weather(client: httpx.AsyncClient, city_name: str) 
             "forecast_days": 10,
         },
     )
-    fc_resp.raise_for_status()
-    fc = fc_resp.json()
 
     cur = fc.get("current") or {}
     cur_t = cur.get("temperature_2m")
