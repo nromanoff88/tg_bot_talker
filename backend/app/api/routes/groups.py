@@ -451,6 +451,7 @@ async def sandbox_chat_reply(
             group_id=group_id,
             sandbox_messages=[m.model_dump() for m in payload.messages],
             include_real_history=payload.include_real_history,
+            tag_bot=payload.tag_bot,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

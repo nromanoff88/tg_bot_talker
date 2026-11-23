@@ -26,6 +26,8 @@ interface SandboxEntry {
   memberId?: string | null;
   createdAt: string;
   text: string;
+  tagBot?: boolean;
+  isDirectPing?: boolean;
   action?: 'ignore' | 'react' | 'reply' | 'message' | 'poll' | 'proactive';
   emoji?: string | null;
   pollData?: Record<string, any> | null;
@@ -53,6 +55,7 @@ export function SandboxChatTab({ group }: Props) {
   const [selectedMemberId, setSelectedMemberId] = useState<string>('');
   const [customSenderName, setCustomSenderName] = useState<string>('Админ');
   const [includeRealHistory, setIncludeRealHistory] = useState<boolean>(true);
+  const [tagBot, setTagBot] = useState<boolean>(true);
   const [proactiveMode, setProactiveMode] = useState<'auto' | 'revive' | 'new_topic'>('auto');
   const [silenceOverride, setSilenceOverride] = useState<string>('');
 
@@ -124,6 +127,7 @@ export function SandboxChatTab({ group }: Props) {
     setErrorMsg('');
     const { memberId, senderName } = resolveCurrentSender();
     const nowIso = new Date().toISOString();
+    const usedTagBot = tagBot;
     const userEntry: SandboxEntry = {
       id: `u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       role: 'user',
@@ -131,6 +135,7 @@ export function SandboxChatTab({ group }: Props) {
       memberId,
       createdAt: nowIso,
       text: cleanText,
+      tagBot: usedTagBot,
     };
 
     const nextEntries = [...entries, userEntry];
@@ -142,6 +147,7 @@ export function SandboxChatTab({ group }: Props) {
       const res = await api.sandboxChat(group.id, {
         messages: toSandboxHistory(nextEntries),
         include_real_history: includeRealHistory,
+        tag_bot: usedTagBot,
       });
       const botEntry: SandboxEntry = {
         id: `b-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -149,6 +155,8 @@ export function SandboxChatTab({ group }: Props) {
         senderName: res.persona_name || 'Бот',
         createdAt: new Date().toISOString(),
         text: res.text || '',
+        tagBot: usedTagBot,
+        isDirectPing: Boolean(res.retrieved_context_meta?.is_direct_ping),
         action: res.action,
         emoji: res.emoji,
         pollData: res.poll_data,
@@ -215,10 +223,10 @@ export function SandboxChatTab({ group }: Props) {
       <div className="bg-indigo-950/30 border border-indigo-500/30 rounded-2xl p-4 flex items-start gap-3">
         <FlaskConical className="w-5 h-5 text-indigo-400 shrink-0 mt-0.5" />
         <div className="text-xs text-slate-300 leading-relaxed">
-          <span className="font-semibold text-indigo-300">Режим песочницы:</span> бот отвечает точно так же, как
-          при прямом теге в Telegram (с учётом текущей персоны, промптов, досье участников и pgvector-памяти), но{' '}
+          <span className="font-semibold text-indigo-300">Режим песочницы:</span> бот оценивает сообщение с учётом
+          текущей персоны, промптов, общительности, досье участников и pgvector-памяти (в режиме с тегом или без него), но{' '}
           <span className="text-white font-medium">ничего не сохраняет в базу данных</span>, не запоминает эти реплики
-          и не отправляет сообщения в чат.
+          и не отправляет сообщения в Telegram.
         </div>
       </div>
 
@@ -333,13 +341,13 @@ export function SandboxChatTab({ group }: Props) {
       )}
 
       {/* Chat Stream */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col h-[560px]">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col h-[580px]">
         <div className="flex-1 overflow-y-auto p-4 space-y-3">
           {entries.length === 0 ? (
             <div className="text-xs text-slate-500 text-center py-20 space-y-2">
-              <p>Напишите сообщение ниже или нажмите «Протестировать инициативу».</p>
+              <p>Напишите сообщение ниже (с галочкой «Тегнуть бота» или без неё) либо протестируйте инициативу.</p>
               <p className="text-[11px] text-slate-600">
-                Подсказка: если выбрать участника из списка выше, бот будет обращаться к нему с опорой на его реальное досье и факты.
+                Под каждым ответом или молчанием бота сразу видно объяснение модели из роутера — почему она решила ответить, поставить реакцию или промолчать.
               </p>
             </div>
           ) : (
@@ -378,7 +386,7 @@ export function SandboxChatTab({ group }: Props) {
                     }`}
                   >
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex flex-wrap items-center gap-1.5">
                         {isUser ? (
                           <User className="w-3.5 h-3.5 text-indigo-300" />
                         ) : (
@@ -387,10 +395,26 @@ export function SandboxChatTab({ group }: Props) {
                         <span className={`font-semibold ${isUser ? 'text-indigo-200' : 'text-emerald-300'}`}>
                           {entry.senderName}
                         </span>
+                        {isUser && entry.tagBot !== undefined && (
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[10px] border ${
+                              entry.tagBot
+                                ? 'bg-indigo-500/20 text-indigo-200 border-indigo-400/30'
+                                : 'bg-slate-800/80 text-slate-400 border-slate-700'
+                            }`}
+                          >
+                            {entry.tagBot ? 'С тегом бота' : 'Без тега'}
+                          </span>
+                        )}
                         {badgeLabel && (
                           <span className={`px-2 py-0.5 rounded-full text-[10px] border ${badgeCls}`}>
                             {badgeLabel}
                             {entry.emoji ? ` ${entry.emoji}` : ''}
+                          </span>
+                        )}
+                        {!isUser && entry.action !== 'proactive' && entry.tagBot === false && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] border bg-slate-900 text-slate-400 border-slate-700">
+                            {entry.isDirectPing ? 'Упомянут в тексте' : 'Без тега'}
                           </span>
                         )}
                       </div>
@@ -430,8 +454,13 @@ export function SandboxChatTab({ group }: Props) {
                       </div>
                     )}
 
-                    {entry.action === 'ignore' && (
-                      <div className="text-slate-400 italic">Бот решил промолчать: {entry.reasoning}</div>
+                    {!isUser && entry.reasoning && (
+                      <div className="p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 space-y-1">
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                          Мысль модели (почему {entry.action === 'ignore' ? 'промолчала' : 'вмешалась'})
+                        </div>
+                        <p className="text-slate-300 leading-relaxed">{entry.reasoning}</p>
+                      </div>
                     )}
 
                     {entry.gateNotes && entry.gateNotes.length > 0 && (
@@ -450,23 +479,18 @@ export function SandboxChatTab({ group }: Props) {
                       </div>
                     )}
 
-                    {!isUser && (entry.reasoning || promptSections.length > 0 || factsUsed.length > 0 || episodesUsed.length > 0) && (
+                    {!isUser && (promptSections.length > 0 || factsUsed.length > 0 || episodesUsed.length > 0 || entry.modelUsed) && (
                       <details className="pt-1 border-t border-slate-800/80 text-[11px] text-slate-400">
                         <summary className="cursor-pointer hover:text-indigo-300 text-indigo-400/90 font-medium">
-                          Мысли, память и промпты
+                          Память и промпты
                           {entry.modelUsed ? ` · ${entry.modelUsed}` : ''}
                           {typeof entry.costUsd === 'number' && entry.costUsd > 0 ? ` ($${entry.costUsd.toFixed(5)})` : ''}
                         </summary>
                         <div className="mt-2 space-y-2 pl-2 border-l border-indigo-500/30">
-                          {entry.reasoning && (
-                            <p className="text-slate-300">
-                              <span className="text-slate-500">Роутер:</span> {entry.reasoning}
-                            </p>
-                          )}
                           {(factsUsed.length > 0 || episodesUsed.length > 0) && (
                             <div className="space-y-1">
                               <div className="text-slate-500">
-                                Память: {factsUsed.length} факт., {episodesUsed.length} эпиз.
+                                Использовано из памяти: {factsUsed.length} факт., {episodesUsed.length} эпиз.
                               </div>
                               {episodesUsed.map((ep: any, i: number) => (
                                 <div key={i} className="text-amber-300/90">
@@ -506,7 +530,7 @@ export function SandboxChatTab({ group }: Props) {
           {busy && (
             <div className="flex justify-start">
               <div className="px-4 py-2.5 rounded-2xl bg-slate-950 border border-slate-800 text-xs text-slate-400">
-                {loadingProactive ? 'Придумывает повод написать...' : 'Печатает ответ...'}
+                {loadingProactive ? 'Придумывает повод написать...' : 'Оценивает сообщение и готовит ответ...'}
               </div>
             </div>
           )}
@@ -514,7 +538,7 @@ export function SandboxChatTab({ group }: Props) {
         </div>
 
         {/* Message Composer */}
-        <form onSubmit={handleSend} className="p-3 border-t border-slate-800 flex gap-2 items-end">
+        <form onSubmit={handleSend} className="p-3 border-t border-slate-800 flex flex-col sm:flex-row gap-2.5 sm:items-end">
           <textarea
             rows={2}
             value={inputText}
@@ -529,14 +553,28 @@ export function SandboxChatTab({ group }: Props) {
             disabled={busy}
             className="flex-1 px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white focus:outline-none focus:border-indigo-500 resize-none disabled:opacity-50"
           />
-          <button
-            type="submit"
-            disabled={!inputText.trim() || busy}
-            className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-xs font-medium text-white flex items-center gap-1.5 cursor-pointer h-10"
-          >
-            <Send className="w-3.5 h-3.5" />
-            Отправить
-          </button>
+          <div className="flex items-center justify-between sm:justify-end gap-3 shrink-0">
+            <label
+              className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 cursor-pointer select-none h-10"
+              title="Если включено — сообщение уйдёт как прямой тег/реплай боту. Если снято — как обычное сообщение в чат (бот сам решает, вмешиваться ли)."
+            >
+              <input
+                type="checkbox"
+                checked={tagBot}
+                onChange={(e) => setTagBot(e.target.checked)}
+                disabled={busy}
+              />
+              <span>Тегнуть бота</span>
+            </label>
+            <button
+              type="submit"
+              disabled={!inputText.trim() || busy}
+              className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-xs font-medium text-white flex items-center gap-1.5 cursor-pointer h-10"
+            >
+              <Send className="w-3.5 h-3.5" />
+              Отправить
+            </button>
+          </div>
         </form>
       </div>
     </div>

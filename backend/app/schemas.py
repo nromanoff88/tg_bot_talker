@@ -399,6 +399,7 @@ class SandboxChatMessage(BaseModel):
 class SandboxChatRequest(BaseModel):
     messages: list[SandboxChatMessage] = Field(min_length=1, max_length=50)
     include_real_history: bool = True
+    tag_bot: bool = True
 
 
 class SandboxChatResponse(BaseModel):

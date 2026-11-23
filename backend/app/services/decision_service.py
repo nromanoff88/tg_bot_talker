@@ -740,15 +740,18 @@ async def simulate_tagged_reply(
     group_id: int,
     sandbox_messages: list[dict[str, Any]],
     include_real_history: bool = True,
+    tag_bot: bool = True,
 ) -> dict[str, Any]:
     """
-    Эфемерная симуляция ответа бота в песочнице админки (как при прямом теге в Telegram):
-    - читает текущую память группы, участников и настройки;
+    Эфемерная симуляция ответа бота в песочнице админки:
+    - tag_bot=True: симулирует прямое обращение/тег к боту;
+    - tag_bot=False: обычное сообщение в чат без принудительного тега (проверяются лишь @username/имя персоны);
     - НЕ сохраняет сообщения, НЕ пишет DecisionLog и НЕ отправляет ничего в Telegram.
     """
     group = await load_group_readonly(session, group_id)
 
     g_settings = group.settings or GroupSettings(group_id=group_id)
+    sys_cfg = await session.get(SystemConfig, 1)
     persona = await resolve_effective_persona(session, group)
     persona_name = str(persona.get("display_name") or "Бот")
 
@@ -781,6 +784,28 @@ async def simulate_tagged_reply(
     trigger_set = {m.telegram_message_id for m in trigger_msgs}
     now_str = format_current_datetime_context(g_settings.timezone, now_utc)
 
+    if tag_bot:
+        is_direct_ping = True
+    else:
+        bot_username = (sys_cfg.bot_username or "").lower().lstrip("@") if sys_cfg else ""
+        persona_name_lower = persona_name.strip().lower()
+        persona_name_pattern = _build_persona_name_pattern(persona_name_lower) if len(persona_name_lower) >= 3 else None
+        txt_low = trigger_msgs[-1].text_content.lower()
+        is_direct_ping = bool(
+            (bot_username and f"@{bot_username}" in txt_low)
+            or (persona_name_pattern and re.search(persona_name_pattern, txt_low))
+        )
+
+    effective_chattiness = g_settings.chattiness_level
+    if (
+        not is_direct_ping
+        and g_settings.quiet_hours_enabled
+        and is_within_quiet_hours(g_settings.timezone, g_settings.quiet_hours_start, g_settings.quiet_hours_end, now_utc)
+    ):
+        effective_chattiness = round(effective_chattiness * 0.35, 2)
+
+    router_direct_ping = True if tag_bot else (is_direct_ping and g_settings.reply_on_mention)
+
     raw_action, target_msg_id, reasoning, router_json, router_prompts, router_usage = await _run_router_and_plan(
         session=session,
         group=group,
@@ -789,10 +814,16 @@ async def simulate_tagged_reply(
         recent_msgs=recent_msgs,
         trigger_msgs=trigger_msgs,
         trigger_set=trigger_set,
-        effective_chattiness=g_settings.chattiness_level,
-        router_direct_ping=True,
+        effective_chattiness=effective_chattiness,
+        router_direct_ping=router_direct_ping,
         now_str=now_str,
     )
+
+    base_meta = {
+        "is_direct_ping": is_direct_ping,
+        "tag_bot": tag_bot,
+        "chattiness": effective_chattiness,
+    }
 
     if raw_action == "ignore":
         return {
@@ -806,7 +837,7 @@ async def simulate_tagged_reply(
             "prompt_tokens": router_usage.prompt_tokens,
             "completion_tokens": router_usage.completion_tokens,
             "cost_usd": router_usage.cost_usd,
-            "retrieved_context_meta": {"is_direct_ping": True, "llm_prompts": router_prompts},
+            "retrieved_context_meta": {**base_meta, "llm_prompts": router_prompts},
         }
 
     if raw_action == "react":
@@ -825,7 +856,7 @@ async def simulate_tagged_reply(
             "prompt_tokens": router_usage.prompt_tokens,
             "completion_tokens": router_usage.completion_tokens,
             "cost_usd": router_usage.cost_usd,
-            "retrieved_context_meta": {"is_direct_ping": True, "llm_prompts": router_prompts},
+            "retrieved_context_meta": {**base_meta, "llm_prompts": router_prompts},
         }
 
     if raw_action == "poll":
@@ -835,7 +866,7 @@ async def simulate_tagged_reply(
             recent_msgs=recent_msgs,
             topic_hint=f"{reasoning} | Последняя реплика: {trigger_msgs[-1].text_content[:200]}",
         )
-        poll_ctx_meta["is_direct_ping"] = True
+        poll_ctx_meta.update(base_meta)
         poll_ctx_meta["router_action"] = "poll"
         poll_ctx_meta["llm_prompts"] = {
             **router_prompts,
@@ -868,9 +899,11 @@ async def simulate_tagged_reply(
         reasoning=reasoning,
         router_json=router_json,
         router_prompts=router_prompts,
-        is_direct_ping_meta=True,
+        is_direct_ping_meta=is_direct_ping,
         now_str=now_str,
     )
+    context_meta["tag_bot"] = tag_bot
+    context_meta["chattiness"] = effective_chattiness
     total_usage = router_usage + smart_usage
 
     if not reply_text:

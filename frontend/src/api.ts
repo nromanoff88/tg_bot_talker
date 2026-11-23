@@ -253,7 +253,7 @@ export const api = {
     }),
   sandboxChat: (
     groupId: number,
-    payload: { messages: SandboxChatMessage[]; include_real_history: boolean }
+    payload: { messages: SandboxChatMessage[]; include_real_history: boolean; tag_bot: boolean }
   ) =>
     request<SandboxChatResponse>(`/api/groups/${groupId}/sandbox/chat`, {
       method: 'POST',
