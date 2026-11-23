@@ -1,5 +1,4 @@
 import logging
-import random
 import re
 import uuid
 from dataclasses import dataclass
@@ -578,41 +577,14 @@ async def evaluate_group_batch_and_decide(
             )
             return BotDecisionResult(action="ignore", reasoning=reason)
 
+    # В тихие часы снижаем расчётную общительность для роутера; окончательное решение о вмешательстве принимает сама модель
     effective_chattiness = g_settings.chattiness_level
     if (
         not is_direct_ping
         and g_settings.quiet_hours_enabled
         and is_within_quiet_hours(g_settings.timezone, g_settings.quiet_hours_start, g_settings.quiet_hours_end, now_utc)
     ):
-        # В тихие часы не встреваем сами без веского повода
         effective_chattiness = round(effective_chattiness * 0.35, 2)
-
-    # Hard Gate 3: математический вероятностный фильтр для сообщений без прямого обращения к боту
-    if not is_direct_ping and effective_chattiness < 1.0:
-        if effective_chattiness <= 0.0:
-            reason = "Общительность группы 0% — без прямого тега или реплая бот молчит."
-            await _save_decision_log(
-                session, group_id, trigger_tg_msg_ids, "ignore", reason, {}, {"gate": "chattiness_zero"}, LLMUsage()
-            )
-            return BotDecisionResult(action="ignore", reasoning=reason)
-
-        roll = random.random()
-        if roll > effective_chattiness:
-            reason = (
-                f"Вероятностный фильтр (общительность {int(effective_chattiness * 100)}%, "
-                f"выпало {roll:.2f}) — бот решил не вмешиваться без прямого обращения."
-            )
-            await _save_decision_log(
-                session,
-                group_id,
-                trigger_tg_msg_ids,
-                "ignore",
-                reason,
-                {},
-                {"gate": "chattiness_roll", "chattiness": effective_chattiness, "roll": round(roll, 3)},
-                LLMUsage(),
-            )
-            return BotDecisionResult(action="ignore", reasoning=reason)
 
     # Собираем контекст и спрашиваем Fast LLM Роутер
     now_str = format_current_datetime_context(g_settings.timezone, now_utc)
