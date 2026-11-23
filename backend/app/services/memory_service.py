@@ -20,6 +20,7 @@ from app.models import (
     PersonaTemplate,
 )
 from app.redis_client import get_redis, publish_group_event
+from app.services.external_context_service import get_external_context_blocks
 from app.services.llm_service import complete_json, create_embedding
 from app.services.prompt_service import render_prompt
 
@@ -406,6 +407,10 @@ async def collect_persona_prompt_vars(
         ),
     }
 
+    weather_block, news_block = await get_external_context_blocks(session)
+    prompt_vars["weather_block"] = weather_block
+    prompt_vars["news_block"] = news_block
+
     meta = {
         "persona_name": persona["display_name"],
         "current_local_time": now_str,
@@ -413,6 +418,8 @@ async def collect_persona_prompt_vars(
         "members_loaded": [m.display_name for m in members],
         "facts_used": used_facts_meta[:15],
         "episodes_used": used_episodes_meta,
+        "has_weather": bool(weather_block),
+        "has_news": bool(news_block),
     }
     return prompt_vars, meta
 
@@ -434,6 +441,12 @@ async def build_persona_generation_context(
     prompt_vars, meta = await collect_persona_prompt_vars(session, group, recent_messages, episodes_with_sim)
     meta["memory_query"] = memory_query
     system_prompt = await render_prompt(session, "persona_system_prompt", prompt_vars)
+    w_block = prompt_vars.get("weather_block") or ""
+    n_block = prompt_vars.get("news_block") or ""
+    if w_block and w_block not in system_prompt:
+        system_prompt += f"\n\nПОГОДА И ПРОГНОЗ (ИСПОЛЬЗУЙ ТОЛЬКО К МЕСТУ):\n{w_block}"
+    if n_block and n_block not in system_prompt:
+        system_prompt += f"\n\nАКТУАЛЬНЫЕ НОВОСТИ ИЗ ТГ-КАНАЛОВ (ИСПОЛЬЗУЙ ТОЛЬКО К МЕСТУ):\n{n_block}"
     return system_prompt, meta
 
 

@@ -41,6 +41,10 @@ class SystemConfigResponse(BaseModel):
     bot_online: bool = False
     bot_last_heartbeat: Optional[datetime] = None
 
+    weather_city: str = ""
+    news_tg_channels: list[str] = Field(default_factory=list)
+    news_topics: str = ""
+
 
 class SystemConfigUpdate(BaseModel):
     llm_base_url: str
@@ -51,6 +55,22 @@ class SystemConfigUpdate(BaseModel):
     embedding_base_url: str
     embedding_api_key: Optional[str] = None
     embedding_model: str
+
+    weather_city: str = ""
+    news_tg_channels: list[str] = Field(default_factory=list)
+    news_topics: str = ""
+
+
+class ExternalContextStatusResponse(BaseModel):
+    weather_city: str = ""
+    weather_block: str = ""
+    weather_updated_at: Optional[str] = None
+    news_tg_channels: list[str] = Field(default_factory=list)
+    news_topics: str = ""
+    news_block: str = ""
+    news_updated_at: Optional[str] = None
+    raw_posts_fetched: int = 0
+    errors: list[str] = Field(default_factory=list)
 
 
 class PromptVariableDoc(BaseModel):

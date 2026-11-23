@@ -46,6 +46,24 @@ async def init_db() -> None:
                 "ADD COLUMN IF NOT EXISTS prompt_templates JSONB DEFAULT '{}'::jsonb"
             )
         )
+        await conn.execute(
+            text(
+                "ALTER TABLE system_config "
+                "ADD COLUMN IF NOT EXISTS weather_city VARCHAR(255) DEFAULT ''"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE system_config "
+                "ADD COLUMN IF NOT EXISTS news_tg_channels JSONB DEFAULT '[]'::jsonb"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE system_config "
+                "ADD COLUMN IF NOT EXISTS news_topics TEXT DEFAULT ''"
+            )
+        )
 
     async with AsyncSessionLocal() as session:
         # 1. Инициализация глобальной конфигурации LLM (и синхронизация с .env, если в БД остались пустые/дефолтные поля)

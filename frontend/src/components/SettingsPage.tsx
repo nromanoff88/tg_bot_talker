@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { CheckCircle2, Save, Wifi, XCircle } from 'lucide-react';
+import { CheckCircle2, CloudSun, Newspaper, RefreshCw, Save, Wifi, XCircle } from 'lucide-react';
 import { api } from '../api';
-import type { SystemConfig } from '../types';
+import type { ExternalContextStatus, SystemConfig } from '../types';
 
 export function SettingsPage({ onSaved }: { onSaved: () => void }) {
   const [cfg, setCfg] = useState<SystemConfig | null>(null);
@@ -13,19 +13,29 @@ export function SettingsPage({ onSaved }: { onSaved: () => void }) {
   const [embApiKey, setEmbApiKey] = useState('');
   const [embModel, setEmbModel] = useState('');
 
+  const [weatherCity, setWeatherCity] = useState('');
+  const [newsChannelsText, setNewsChannelsText] = useState('');
+  const [newsTopics, setNewsTopics] = useState('');
+  const [extStatus, setExtStatus] = useState<ExternalContextStatus | null>(null);
+  const [refreshingExt, setRefreshingExt] = useState(false);
+
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState('');
   const [testResult, setTestResult] = useState<any>(null);
 
   const load = async () => {
-    const data = await api.getLLMConfig();
+    const [data, ext] = await Promise.all([api.getLLMConfig(), api.getExternalContext()]);
     setCfg(data);
     setLlmBaseUrl(data.llm_base_url);
     setFastModel(data.llm_fast_model);
     setSmartModel(data.llm_smart_model);
     setEmbBaseUrl(data.embedding_base_url);
     setEmbModel(data.embedding_model);
+    setWeatherCity(data.weather_city || '');
+    setNewsChannelsText((data.news_tg_channels || []).join(', '));
+    setNewsTopics(data.news_topics || '');
+    setExtStatus(ext);
     setLlmApiKey('');
     setEmbApiKey('');
   };
@@ -33,6 +43,12 @@ export function SettingsPage({ onSaved }: { onSaved: () => void }) {
   useEffect(() => {
     load();
   }, []);
+
+  const parseChannels = (raw: string): string[] =>
+    raw
+      .split(/[\s,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -47,14 +63,43 @@ export function SettingsPage({ onSaved }: { onSaved: () => void }) {
         embedding_base_url: embBaseUrl,
         embedding_api_key: embApiKey || undefined,
         embedding_model: embModel,
+        weather_city: weatherCity.trim(),
+        news_tg_channels: parseChannels(newsChannelsText),
+        news_topics: newsTopics.trim(),
       });
       await load();
       onSaved();
-      setMessage('Настройки моделей успешно применены на лету (перезапуск контейнеров не требуется).');
+      setMessage('Настройки моделей и внешнего контекста успешно применены на лету.');
     } catch (err: any) {
       setMessage(`Ошибка: ${err.message}`);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleRefreshExternal = async () => {
+    setRefreshingExt(true);
+    setMessage('');
+    try {
+      await api.updateLLMConfig({
+        llm_base_url: llmBaseUrl,
+        llm_api_key: llmApiKey || undefined,
+        llm_fast_model: fastModel,
+        llm_smart_model: smartModel,
+        embedding_base_url: embBaseUrl,
+        embedding_api_key: embApiKey || undefined,
+        embedding_model: embModel,
+        weather_city: weatherCity.trim(),
+        news_tg_channels: parseChannels(newsChannelsText),
+        news_topics: newsTopics.trim(),
+      });
+      const res = await api.refreshExternalContext();
+      setExtStatus(res);
+      setMessage('Погода на 10 дней и новости из Telegram-каналов обновлены.');
+    } catch (err: any) {
+      setMessage(`Ошибка обновления погоды/новостей: ${err.message}`);
+    } finally {
+      setRefreshingExt(false);
     }
   };
 
@@ -189,6 +234,126 @@ export function SettingsPage({ onSaved }: { onSaved: () => void }) {
               />
             </div>
           </div>
+        </div>
+
+        <div className="pt-5 border-t border-slate-800 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-sky-300 uppercase tracking-wider flex items-center gap-2">
+              <CloudSun className="w-4 h-4" />
+              3. Погода (прогноз на 10 дней) и Новости из Telegram-каналов
+            </h3>
+            <button
+              type="button"
+              onClick={handleRefreshExternal}
+              disabled={refreshingExt || saving}
+              className="px-3.5 py-1.5 rounded-xl bg-sky-500/15 hover:bg-sky-500/25 disabled:opacity-40 text-sky-300 border border-sky-500/30 text-xs font-medium flex items-center gap-1.5 cursor-pointer"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshingExt ? 'animate-spin' : ''}`} />
+              {refreshingExt ? 'Обновляем...' : 'Обновить погоду и новости сейчас'}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">
+                Город для погоды (через запятую до 3 городов)
+              </label>
+              <input
+                type="text"
+                value={weatherCity}
+                onChange={(e) => setWeatherCity(e.target.value)}
+                placeholder="Уфа"
+                className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white"
+              />
+              <span className="text-[11px] text-slate-500">
+                Текущая погода + прогноз на 10 дней с датами (Open-Meteo, обновляется каждые ~25 мин)
+              </span>
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">
+                Интересующие темы для фильтрации новостей
+              </label>
+              <input
+                type="text"
+                value={newsTopics}
+                onChange={(e) => setNewsTopics(e.target.value)}
+                placeholder="Уфа, автомобили, IT, игры, экономика, спорт"
+                className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white"
+              />
+              <span className="text-[11px] text-slate-500">
+                Fast LLM отфильтрует посты по этим темам и уберёт рекламу и дубли
+              </span>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">
+              Публичные Telegram-каналы для новостей (через запятую или с новой строки)
+            </label>
+            <textarea
+              rows={2}
+              value={newsChannelsText}
+              onChange={(e) => setNewsChannelsText(e.target.value)}
+              placeholder="@rbc_news, @ufa1ru, https://t.me/rian_ru"
+              className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white"
+            />
+            <span className="text-[11px] text-slate-500">
+              Можно указывать @username или ссылку t.me/... — каналы должны быть публичными (с веб-предпросмотром)
+            </span>
+          </div>
+
+          {(extStatus?.weather_block || extStatus?.news_block || (extStatus?.errors && extStatus.errors.length > 0)) && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 pt-2">
+              <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-medium text-sky-300 flex items-center gap-1.5">
+                    <CloudSun className="w-3.5 h-3.5" />
+                    Кэш погоды (10 дней)
+                  </span>
+                  {extStatus.weather_updated_at && (
+                    <span className="text-[10px] text-slate-500">
+                      {new Date(extStatus.weather_updated_at).toLocaleTimeString('ru-RU', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}
+                    </span>
+                  )}
+                </div>
+                <pre className="whitespace-pre-wrap text-[11px] text-slate-300 font-sans leading-relaxed max-h-48 overflow-y-auto">
+                  {extStatus.weather_block || 'Пока не загружена — укажите город и нажмите «Обновить».'}
+                </pre>
+              </div>
+
+              <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-medium text-amber-300 flex items-center gap-1.5">
+                    <Newspaper className="w-3.5 h-3.5" />
+                    Кэш новостей из ТГ ({extStatus.raw_posts_fetched} постов)
+                  </span>
+                  {extStatus.news_updated_at && (
+                    <span className="text-[10px] text-slate-500">
+                      {new Date(extStatus.news_updated_at).toLocaleTimeString('ru-RU', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}
+                    </span>
+                  )}
+                </div>
+                <pre className="whitespace-pre-wrap text-[11px] text-slate-300 font-sans leading-relaxed max-h-48 overflow-y-auto">
+                  {extStatus.news_block || 'Пока нет дайджеста — укажите публичные ТГ-каналы и нажмите «Обновить».'}
+                </pre>
+              </div>
+            </div>
+          )}
+
+          {extStatus?.errors && extStatus.errors.length > 0 && (
+            <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300 space-y-1">
+              {extStatus.errors.map((err, i) => (
+                <div key={i}>• {err}</div>
+              ))}
+            </div>
+          )}
         </div>
 
         {message && (

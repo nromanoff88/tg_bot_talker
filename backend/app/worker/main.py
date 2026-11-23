@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.database import AsyncSessionLocal, init_db
 from app.models import Group
 from app.redis_client import parse_arq_redis_settings
+from app.services.external_context_service import ensure_external_context_fresh
 from app.services.memory_service import analyze_group_memory_batch
 from app.services.proactive_service import check_all_groups_for_proactive_initiative
 
@@ -130,6 +131,12 @@ async def periodic_maintenance_cron(ctx: dict[str, Any]) -> None:
         triggered = await check_all_groups_for_proactive_initiative(session)
         if triggered:
             logger.info("Proactive initiative triggered in %s group(s).", triggered)
+
+        # 3. Упреждающе обновляем кэш погоды и новостей из Telegram-каналов
+        try:
+            await ensure_external_context_fresh(session)
+        except Exception as exc:
+            logger.warning("Periodic external context refresh failed: %s", exc)
 
 
 class WorkerSettings:

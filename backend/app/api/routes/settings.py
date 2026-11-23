@@ -21,6 +21,7 @@ from app.models import (
 )
 from app.schemas import (
     DashboardStatsResponse,
+    ExternalContextStatusResponse,
     PersonaTemplateCreate,
     PersonaTemplateOut,
     PersonaTemplateUpdate,
@@ -31,6 +32,13 @@ from app.schemas import (
     PromptVariableDoc,
     SystemConfigResponse,
     SystemConfigUpdate,
+)
+from app.services.external_context_service import (
+    get_external_context_blocks,
+    get_external_context_status,
+    invalidate_external_context_cache,
+    normalize_tg_channels_list,
+    refresh_external_context,
 )
 from app.services.llm_service import invalidate_llm_config_cache, test_llm_connectivity
 from app.services.memory_service import (
@@ -138,6 +146,9 @@ async def get_llm_settings(session: AsyncSession = Depends(get_db)) -> SystemCon
         bot_display_name=cfg.bot_display_name,
         bot_online=_is_bot_online(cfg.bot_last_heartbeat),
         bot_last_heartbeat=cfg.bot_last_heartbeat,
+        weather_city=cfg.weather_city or "",
+        news_tg_channels=list(cfg.news_tg_channels or []),
+        news_topics=cfg.news_topics or "",
     )
 
 
@@ -150,6 +161,12 @@ async def update_llm_settings(
     if not cfg:
         cfg = SystemConfig(id=1)
         session.add(cfg)
+
+    old_ext = (
+        (cfg.weather_city or "").strip(),
+        list(cfg.news_tg_channels or []),
+        (cfg.news_topics or "").strip(),
+    )
 
     cfg.llm_base_url = payload.llm_base_url.strip()
     if payload.llm_api_key is not None and payload.llm_api_key.strip() and "..." not in payload.llm_api_key:
@@ -168,10 +185,32 @@ async def update_llm_settings(
         cfg.embedding_api_key = payload.embedding_api_key.strip()
     cfg.embedding_model = payload.embedding_model.strip()
 
+    cfg.weather_city = (payload.weather_city or "").strip()[:255]
+    cfg.news_tg_channels = normalize_tg_channels_list(payload.news_tg_channels)
+    cfg.news_topics = (payload.news_topics or "").strip()
+
+    new_ext = (cfg.weather_city, list(cfg.news_tg_channels), cfg.news_topics)
+
     await session.commit()
     await session.refresh(cfg)
     invalidate_llm_config_cache()
+    if old_ext != new_ext:
+        await invalidate_external_context_cache()
+        try:
+            await refresh_external_context(session, force_weather=(old_ext[0] != new_ext[0]), force_news=(old_ext[1:] != new_ext[1:]))
+        except Exception:
+            pass
     return await get_llm_settings(session)
+
+
+@router.get("/settings/external-context", response_model=ExternalContextStatusResponse)
+async def get_external_context(session: AsyncSession = Depends(get_db)) -> ExternalContextStatusResponse:
+    return ExternalContextStatusResponse(**(await get_external_context_status(session)))
+
+
+@router.post("/settings/external-context/refresh", response_model=ExternalContextStatusResponse)
+async def refresh_external_context_endpoint(session: AsyncSession = Depends(get_db)) -> ExternalContextStatusResponse:
+    return ExternalContextStatusResponse(**(await refresh_external_context(session, force_weather=True, force_news=True)))
 
 
 @router.post("/settings/llm/test")
@@ -342,6 +381,7 @@ async def preview_prompt_template(
         _ = resolve_effective_persona  # ensure import used cleanly if needed
     else:
         now_str = format_current_datetime_context("Europe/Moscow")
+        w_preview, n_preview = await get_external_context_blocks(session)
         ctx = {
             "group_title": "Тестовый чат",
             "group_id": -100123456789,
@@ -378,6 +418,8 @@ async def preview_prompt_template(
             "silence_minutes": "60",
             "recent_preview": "Никита: Всем привет!",
             "member_hooks": "- Никита: любит лыжи",
+            "weather_block": w_preview or "Город Уфа: сейчас -3°C, переменная облачность\nПрогноз на 10 дней:\n- 23.11.2026 (пн, сегодня): -5..+1°C, переменная облачность",
+            "news_block": n_preview or "- [@rbc_news, 23.11] Пример свежей новости для предпросмотра",
         }
 
     try:

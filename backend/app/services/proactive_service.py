@@ -15,6 +15,7 @@ from app.services.decision_service import (
     is_within_quiet_hours,
     load_group_readonly,
 )
+from app.services.external_context_service import get_external_context_blocks
 from app.services.llm_service import LLMUsage, complete_text
 from app.services.memory_service import (
     build_persona_generation_context,
@@ -71,6 +72,7 @@ async def _generate_proactive_draft(
         for m in recent_msgs[-8:]
     )
 
+    weather_block, news_block = await get_external_context_blocks(session)
     prompt_key = "proactive_new_topic_prompt" if start_new_topic else "proactive_revive_prompt"
     user_prompt = await render_prompt(
         session,
@@ -82,6 +84,8 @@ async def _generate_proactive_draft(
             "silence_minutes": f"{silence_hours * 60:.0f}",
             "recent_preview": recent_preview or ("Чат пока пуст." if start_new_topic else "Чат пока почти пуст."),
             "member_hooks": "\n".join(member_hooks) or "Пока мало фактов об участниках.",
+            "weather_block": weather_block,
+            "news_block": news_block,
         },
     )
 

@@ -49,6 +49,10 @@ class SystemConfig(Base):
 
     prompt_templates: Mapped[dict[str, str]] = mapped_column(JSONB, default=dict)
 
+    weather_city: Mapped[str] = mapped_column(String(255), default="")
+    news_tg_channels: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    news_topics: Mapped[str] = mapped_column(Text, default="")
+
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

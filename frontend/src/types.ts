@@ -28,6 +28,21 @@ export interface SystemConfig {
   bot_display_name: string | null;
   bot_online: boolean;
   bot_last_heartbeat: string | null;
+  weather_city: string;
+  news_tg_channels: string[];
+  news_topics: string;
+}
+
+export interface ExternalContextStatus {
+  weather_city: string;
+  weather_block: string;
+  weather_updated_at: string | null;
+  news_tg_channels: string[];
+  news_topics: string;
+  news_block: string;
+  news_updated_at: string | null;
+  raw_posts_fetched: number;
+  errors: string[];
 }
 
 export interface PersonaTemplate {

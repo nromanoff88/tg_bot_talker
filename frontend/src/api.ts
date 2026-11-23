@@ -2,6 +2,7 @@ import type {
   ChatMessage,
   DashboardStats,
   DecisionLog,
+  ExternalContextStatus,
   GeneratePollRequest,
   GroupContext,
   GroupDetail,
@@ -76,11 +77,17 @@ export const api = {
     embedding_base_url: string;
     embedding_api_key?: string;
     embedding_model: string;
+    weather_city?: string;
+    news_tg_channels?: string[];
+    news_topics?: string;
   }) =>
     request<SystemConfig>('/api/settings/llm', {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
+  getExternalContext: () => request<ExternalContextStatus>('/api/settings/external-context'),
+  refreshExternalContext: () =>
+    request<ExternalContextStatus>('/api/settings/external-context/refresh', { method: 'POST' }),
   testLLMConfig: () =>
     request<{
       fast_ok: boolean;
