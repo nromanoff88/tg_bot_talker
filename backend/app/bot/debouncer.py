@@ -1,3 +1,4 @@
+import asyncio
 import time
 from typing import Optional
 
@@ -6,6 +7,8 @@ from app.redis_client import get_redis
 DUE_ZSET_KEY = "bot_talker:debounce:due_groups"
 MSGS_LIST_PREFIX = "bot_talker:debounce:msgs:"
 FIRST_SEEN_PREFIX = "bot_talker:debounce:first_seen:"
+INFLIGHT_PREFIX = "bot_talker:debounce:inflight:"
+INFLIGHT_TTL_SEC = 120
 
 
 async def schedule_group_debounce(group_id: int, tg_message_id: int, delay_seconds: float) -> None:
@@ -37,7 +40,10 @@ async def schedule_group_debounce(group_id: int, tg_message_id: int, delay_secon
 
 
 async def pop_due_debounced_groups() -> list[tuple[int, list[int]]]:
-    """Возвращает список (group_id, [tg_message_ids]), для которых пауза ожидания завершилась."""
+    """
+    Возвращает список (group_id, [tg_message_ids]), для которых пауза ожидания завершилась.
+    Если по группе уже идёт генерация/отправка ответа (in-flight lock), оставляет сообщения в очереди.
+    """
     r = get_redis()
     now = time.time()
 
@@ -47,19 +53,62 @@ async def pop_due_debounced_groups() -> list[tuple[int, list[int]]]:
 
     ready: list[tuple[int, list[int]]] = []
     for gid_str in due_members:
+        group_id = int(gid_str)
+        inflight_key = f"{INFLIGHT_PREFIX}{group_id}"
+        acquired = await r.set(inflight_key, "1", ex=INFLIGHT_TTL_SEC, nx=True)
+        if not acquired:
+            continue
+
         removed = await r.zrem(DUE_ZSET_KEY, gid_str)
         if not removed:
+            await r.delete(inflight_key)
             continue
-        group_id = int(gid_str)
+
         msgs_key = f"{MSGS_LIST_PREFIX}{group_id}"
         first_key = f"{FIRST_SEEN_PREFIX}{group_id}"
 
-        raw_ids = await r.lrange(msgs_key, 0, -1)
-        await r.delete(msgs_key, first_key)
+        pipe = r.pipeline(transaction=True)
+        pipe.lrange(msgs_key, 0, -1)
+        pipe.delete(msgs_key, first_key)
+        raw_ids, _ = await pipe.execute()
 
         msg_ids = [int(x) for x in raw_ids if str(x).lstrip("-").isdigit()]
         if msg_ids:
             ready.append((group_id, msg_ids))
+        else:
+            await r.delete(inflight_key)
 
     return ready
+
+
+async def drain_newly_arrived_messages(group_id: int, max_wait_extra: float = 2.5) -> list[int]:
+    """
+    Проверяет, не появились ли новые сообщения в буфере группы за время генерации ответа LLM.
+    Если появились — кратко дожидается хвоста дебаунса и атомарно забирает их для объединения.
+    """
+    r = get_redis()
+    msgs_key = f"{MSGS_LIST_PREFIX}{group_id}"
+    first_key = f"{FIRST_SEEN_PREFIX}{group_id}"
+
+    if await r.llen(msgs_key) == 0:
+        return []
+
+    due_score = await r.zscore(DUE_ZSET_KEY, str(group_id))
+    if due_score is not None:
+        remaining = float(due_score) - time.time()
+        if 0 < remaining <= max_wait_extra:
+            await asyncio.sleep(remaining)
+
+    pipe = r.pipeline(transaction=True)
+    pipe.zrem(DUE_ZSET_KEY, str(group_id))
+    pipe.lrange(msgs_key, 0, -1)
+    pipe.delete(msgs_key, first_key)
+    _, raw_ids, _ = await pipe.execute()
+
+    return [int(x) for x in raw_ids if str(x).lstrip("-").isdigit()]
+
+
+async def release_group_inflight(group_id: int) -> None:
+    """Снимает блокировку активной обработки по группе после завершения генерации и отправки."""
+    await get_redis().delete(f"{INFLIGHT_PREFIX}{group_id}")
 

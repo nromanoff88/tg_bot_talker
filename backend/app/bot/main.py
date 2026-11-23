@@ -8,7 +8,11 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import ChatAction
 from aiogram.types import ReactionTypeEmoji, ReplyParameters
 
-from app.bot.debouncer import pop_due_debounced_groups
+from app.bot.debouncer import (
+    drain_newly_arrived_messages,
+    pop_due_debounced_groups,
+    release_group_inflight,
+)
 from app.bot.handlers import router as group_router
 from app.config import get_settings
 from app.database import AsyncSessionLocal, init_db
@@ -199,6 +203,21 @@ async def _process_single_debounced_group(bot: Bot, group_id: int, trigger_ids: 
         async with AsyncSessionLocal() as session:
             decision = await evaluate_group_batch_and_decide(session, group_id, trigger_ids)
 
+        # Если пока модель думала в чате дописали новые сообщения — объединяем пачку и даём один актуальный ответ
+        for _ in range(2):
+            extra_ids = await drain_newly_arrived_messages(group_id)
+            if not extra_ids:
+                break
+            trigger_ids = list(dict.fromkeys(trigger_ids + extra_ids))
+            logger.info(
+                "Coalescing %s new message(s) into debounced batch for group %s: %s",
+                len(extra_ids),
+                group_id,
+                trigger_ids,
+            )
+            async with AsyncSessionLocal() as session:
+                decision = await evaluate_group_batch_and_decide(session, group_id, trigger_ids)
+
         if decision.action == "react" and decision.emoji and decision.target_tg_msg_id:
             await asyncio.sleep(0.8)
             try:
@@ -256,6 +275,11 @@ async def _process_single_debounced_group(bot: Bot, group_id: int, trigger_ids: 
                 )
         except Exception:
             pass
+    finally:
+        try:
+            await release_group_inflight(group_id)
+        except Exception as exc:
+            logger.debug("Failed to release in-flight lock for group %s: %s", group_id, exc)
 
 
 async def debounce_watcher_loop(bot: Bot) -> None:
